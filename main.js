@@ -7679,20 +7679,22 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     // in sessionStorage, and it may even be HttpOnly, in which case the page
     // cannot see it at all and the login would never be detected. Leaving the
     // signin page is the reliable signal.
-    const token = this.findAccessToken()
-    if (token) {
-      // Hand it to the pilot immediately. This method is polled during the
-      // login, so we are on the live session page here; later on any
-      // navigation would wipe the sessionStorage that holds it.
-      this.sendToPilot({ accessToken: token, deviceId: this.findDeviceId() })
-    }
     // Being on the login page means not authenticated, whatever token may be
     // lying around: a cookie we failed to expire would otherwise end the wait
     // immediately and close the form under the user's eyes.
     const onSignInPage =
       window.location.pathname.startsWith('/signin') ||
       Boolean(document.querySelector('#signin_email'))
-    return !onSignInPage
+    if (onSignInPage) return false
+
+    // Only now is a token worth keeping. Sending it from the login page would
+    // hand over the stale one that survived the wipe, and it would then be
+    // used instead of the one the user just obtained.
+    const token = this.findAccessToken()
+    if (token) {
+      this.sendToPilot({ accessToken: token, deviceId: this.findDeviceId() })
+    }
+    return true
   }
 
   // P
@@ -8039,17 +8041,20 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     // Do NOT navigate before reading the token: the app keeps it in
     // sessionStorage, which is wiped by a reload, and the token grabbed
     // during the authentication is the one we want.
-    let token = this.store && this.store.accessToken
-    if (token) {
-      this.log('info', 'Using the token captured during the authentication')
-    } else {
-      this.log('info', 'No token captured yet, asking the worker')
+    // Prefer what the page holds right now over what was captured earlier:
+    // after a fresh login the page has the new token, while the pilot may
+    // still be holding one from before.
+    let token = await this.runInWorker('findAccessToken')
+    if (token === false) {
+      // not "no token": the worker reloaded mid-call
+      this.log('warn', 'The worker reloaded, asking for the token again')
       token = await this.runInWorker('findAccessToken')
-      if (token === false) {
-        // not "no token": the worker reloaded mid-call
-        this.log('warn', 'The worker reloaded, asking for the token again')
-        token = await this.runInWorker('findAccessToken')
-      }
+    }
+    if (token) {
+      this.log('info', 'Using the token currently in the page')
+    } else if (this.store && this.store.accessToken) {
+      token = this.store.accessToken
+      this.log('info', 'Using the token captured during the authentication')
     }
     if (token) {
       this.log('info', 'Access token available')
