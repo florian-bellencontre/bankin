@@ -7232,15 +7232,20 @@ const UUID_RE =
 const DEFAULT_CLIENT_ID = null
 const DEFAULT_CLIENT_SECRET = null
 
+// The sourceAccountIdentifier must be byte-for-byte the same on every run,
+// see getUserDataFromWebsite.
+const normalizeEmail = email => String(email).trim().toLowerCase()
+
 class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_MODULE_0__.ContentScript {
   // P
-  async ensureAuthenticated({ account }) {
+  async ensureAuthenticated() {
     this.log('info', '📍️ ensureAuthenticated starts')
-    if (!account) {
-      await this.ensureNotAuthenticated()
-    }
-    await this.goto(`${baseUrl}/signin`)
-    await this.waitForElementInWorker('#signin_email, .accounts, #root')
+
+    // Never log the user out first, unlike most konnectors: the session is
+    // the only thing we have. Signing in again costs a captcha, and the token
+    // only lives two hours, so an existing session is precious.
+    await this.goto(baseUrl)
+    await this.waitForElementInWorker('#signin_email, #root')
 
     if (await this.runInWorker('checkAuthenticated')) {
       this.log('info', 'Already authenticated')
@@ -7249,18 +7254,25 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
 
     // No autologin attempt on purpose: the captcha makes it pointless, and a
     // failed programmatic login is exactly what gets an account flagged.
+    this.log('info', 'Not authenticated, showing the login form')
     await this.showLoginFormAndWaitForAuthentication()
     return true
   }
 
+  /**
+   * Called by the launcher when the user asks to reconnect the account. This
+   * is the only place allowed to drop the session.
+   */
   // P
   async ensureNotAuthenticated() {
     this.log('info', '📍️ ensureNotAuthenticated starts')
-    await this.goto(`${baseUrl}/signin`)
-    await this.waitForElementInWorker('#signin_email, .accounts, #root')
+    await this.goto(baseUrl)
+    await this.waitForElementInWorker('#signin_email, #root')
     if (!(await this.runInWorker('checkAuthenticated'))) {
+      this.log('info', 'Already logged out')
       return true
     }
+    this.log('info', 'Clearing the session')
     await this.evaluateInWorker(function clearSession() {
       window.localStorage.clear()
       window.sessionStorage.clear()
@@ -7346,6 +7358,12 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     return guessedName ? valueOf(cookies[guessedName]) : null
   }
 
+  /**
+   * The launcher compares this to account.auth.accountName on every run and
+   * logs the user out when they differ (WRONG_ACCOUNT_IDENTIFIER), so it has
+   * to be perfectly stable: always lowercased and trimmed, whether it comes
+   * from the API or from the login form.
+   */
   // P
   async getUserDataFromWebsite() {
     this.log('info', '📍️ getUserDataFromWebsite starts')
@@ -7355,14 +7373,15 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       (await this.findTokenInNativeCookies())
     const email = await this.runInWorker('getUserEmail', token)
     if (email) {
-      return { sourceAccountIdentifier: email }
+      this.log('info', 'Identifier taken from the API')
+      return { sourceAccountIdentifier: normalizeEmail(email) }
     }
     // Fall back on what the user typed in the login form: losing the
     // identifier here would abort a run that could otherwise succeed.
     const typedEmail = this.store && this.store.email
     if (typedEmail) {
-      this.log('info', 'Using the email from the login form')
-      return { sourceAccountIdentifier: typedEmail }
+      this.log('info', 'Identifier taken from the login form')
+      return { sourceAccountIdentifier: normalizeEmail(typedEmail) }
     }
     throw new Error(
       'Could not find the user email, cannot give a sourceAccountIdentifier'
