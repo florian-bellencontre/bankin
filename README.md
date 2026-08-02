@@ -13,6 +13,35 @@ What is this konnector about ?
 
 This konnector retrieves your financial data from Bankin' to use in the Cozy Bank app.
 
+### How it works (since v2.0.0)
+
+Bankin' now puts an hCaptcha in front of `/v2/authenticate`, and it is a hard
+gate: the challenge is checked *before* the credentials, so even a wrong
+password answers `challenge_required`. A server cannot log in any more.
+
+The konnector is therefore **client-side** (`clientSide: true`) and runs in two
+halves, under a single slug:
+
+1. **`src/client.js`** runs in the flagship app webview. It opens the Bankin'
+   login page, the user signs in and solves the captcha themselves, then it
+   calls the Bankin' API **from the phone**. Every request to Bankin' comes
+   from the user's own IP with the webview user agent, like a normal use of
+   the app — nothing is replayed from a datacenter.
+2. **`src/index.js`** runs on the server. The client half leaves the collected
+   data in the account (`saveAccountData`) and starts it with `runServerJob`;
+   it only writes the `io.cozy.bank.*` documents, which the clisk bridge
+   cannot do itself.
+
+Two consequences worth knowing:
+
+- the Bankin' access token lives **2 hours** and there is no refresh token, so
+  the konnector is meant to be **run manually**, not on a daily trigger;
+- `runServerJob` is a recent addition to the flagship app: an older
+  Twake/Cozy app will fail with an "unknown method" error.
+
+`src/index.js` keeps its own API code path for standalone runs, but it hits
+the captcha wall on a real account.
+
 ### Open a Pull-Request
 
 If you want to work on this konnector and submit code modifications, feel free to open pull-requests!

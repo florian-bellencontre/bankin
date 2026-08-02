@@ -1202,7 +1202,7 @@
     "@babel/helper-validator-identifier" "^7.22.20"
     to-fast-properties "^2.0.0"
 
-"@cozy/minilog@1.0.0":
+"@cozy/minilog@1.0.0", "@cozy/minilog@^1.0.0":
   version "1.0.0"
   resolved "https://registry.yarnpkg.com/@cozy/minilog/-/minilog-1.0.0.tgz#1acc1aad849261e931e255a5f181b638315f7b84"
   integrity sha512-IkDHF9CLh0kQeSEVsou59ar/VehvenpbEUjLfwhckJyOUqZnKAWmXy8qrBgMT5Loxr8Xjs2wmMnj0D67wP00eQ==
@@ -2580,6 +2580,20 @@ cozy-client@^45.14.1:
     sift "^6.0.0"
     url-search-params-polyfill "^8.0.0"
 
+cozy-clisk@0.38.2:
+  version "0.38.2"
+  resolved "https://registry.yarnpkg.com/cozy-clisk/-/cozy-clisk-0.38.2.tgz#72e3db23df36ea4b99b25c84d42febba5040e5be"
+  integrity sha512-dHpO+BR4Sgi/3+pMwjkEg2OB/fWXY9wLiTUavhMpDwwgqI0fFcrdFdpm6Y7Ez1wAhGsutH9ubXd/LwtQ9DJaMA==
+  dependencies:
+    "@cozy/minilog" "^1.0.0"
+    bluebird-retry "^0.11.0"
+    ky "^0.25.1"
+    lodash "^4.17.21"
+    microee "^0.0.6"
+    p-timeout "^6.0.0"
+    p-wait-for "^5.0.2"
+    post-me "^0.4.5"
+
 cozy-device-helper@^2.1.0:
   version "2.2.0"
   resolved "https://registry.yarnpkg.com/cozy-device-helper/-/cozy-device-helper-2.2.0.tgz#2794157bcd23948e68ef373ab9a67e1a6c17d995"
@@ -3704,7 +3718,6 @@ functional-red-black-tree@^1.0.1:
 
 "geco@git+https://github.com/konnectors/geco.git#0.11.2":
   version "0.11.2"
-  uid fe0da3cdaabd5714a226014efd61c89bc85e7c56
   resolved "git+https://github.com/konnectors/geco.git#fe0da3cdaabd5714a226014efd61c89bc85e7c56"
   dependencies:
     toni "git+https://github.com/konnectors/toni.git#0.6.3"
@@ -4427,6 +4440,11 @@ kind-of@^6.0.2:
   resolved "https://registry.yarnpkg.com/kind-of/-/kind-of-6.0.3.tgz#07c05034a6c349fa06e24fa35aa76db4580ce4dd"
   integrity sha512-dcS1ul+9tmeD95T+x28/ehLgd9mENa3LsvDTtzm3vyBEO7RPptvAD+t44WVXaUjTBRcrpFeFlC8WCruUR456hw==
 
+ky@^0.25.1:
+  version "0.25.1"
+  resolved "https://registry.yarnpkg.com/ky/-/ky-0.25.1.tgz#0df0bd872a9cc57e31acd5dbc1443547c881bfbc"
+  integrity sha512-PjpCEWlIU7VpiMVrTwssahkYXX1by6NCT0fhTUX34F3DTinARlgMpriuroolugFPcMgpPWrOW4mTb984Qm1RXA==
+
 levn@^0.4.1:
   version "0.4.1"
   resolved "https://registry.yarnpkg.com/levn/-/levn-0.4.1.tgz#ae4562c007473b932a6200d403268dd2fffc6ade"
@@ -4988,10 +5006,22 @@ p-locate@^5.0.0:
   dependencies:
     p-limit "^3.0.2"
 
+p-timeout@^6.0.0:
+  version "6.1.4"
+  resolved "https://registry.yarnpkg.com/p-timeout/-/p-timeout-6.1.4.tgz#418e1f4dd833fa96a2e3f532547dd2abdb08dbc2"
+  integrity sha512-MyIV3ZA/PmyBN/ud8vV9XzwTrNtR4jFrObymZYnZqMmW0zA8Z17vnT0rBgFE/TlohB+YCHqXMgZzb3Csp49vqg==
+
 p-try@^2.0.0:
   version "2.2.0"
   resolved "https://registry.yarnpkg.com/p-try/-/p-try-2.2.0.tgz#cb2868540e313d61de58fafbe35ce9004d5540e6"
   integrity sha512-R4nPAVTAU0B9D35/Gk3uJf/7XYbQcyohSKdvAxIRSNghFl4e71hVoGnBNQz9cWaXxO2I10KTC+3jMdvvoKw6dQ==
+
+p-wait-for@^5.0.2:
+  version "5.0.2"
+  resolved "https://registry.yarnpkg.com/p-wait-for/-/p-wait-for-5.0.2.tgz#1546a15e64accf1897377cb1507fa4c756fffe96"
+  integrity sha512-lwx6u1CotQYPVju77R+D0vFomni/AqRfqLmqQ8hekklqZ6gAY9rONh7lBQ0uxWMkC2AuX9b2DVAl8To0NyP1JA==
+  dependencies:
+    p-timeout "^6.0.0"
 
 parent-module@^1.0.0:
   version "1.0.1"
@@ -5127,6 +5157,11 @@ please-upgrade-node@^3.2.0:
   integrity sha512-gQR3WpIgNIKwBMVLkpMUeR3e1/E1y42bqDQZfql+kDeXd8COYfM8PQA4X6y7a8u9Ua9FHmsrrmirW2vHs45hWg==
   dependencies:
     semver-compare "^1.0.0"
+
+post-me@^0.4.5:
+  version "0.4.5"
+  resolved "https://registry.yarnpkg.com/post-me/-/post-me-0.4.5.tgz#6171b721c7b86230c51cfbe48ddea047ef8831ce"
+  integrity sha512-XgPdktF/2M5jglgVDULr9NUb/QNv3bY3g6RG22iTb5MIMtB07/5FJB5fbVmu5Eaopowc6uZx7K3e7x1shPwnXw==
 
 pouchdb-abstract-mapreduce@7.0.0:
   version "7.0.0"
@@ -6150,7 +6185,6 @@ token-types@^4.1.1:
 
 "toni@git+https://github.com/konnectors/toni.git#0.6.3":
   version "0.6.3"
-  uid eb813c9d070b494efd78f788cf627bfc9a1019ec
   resolved "git+https://github.com/konnectors/toni.git#eb813c9d070b494efd78f788cf627bfc9a1019ec"
   dependencies:
     bolgia ">=2.7.4"

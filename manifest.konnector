@@ -1,8 +1,9 @@
 {
-  "version": "1.2.2",
+  "version": "2.0.0",
   "name": "Bankin'",
   "type": "konnector",
   "language": "node",
+  "clientSide": true,
   "icon": "icon.png",
   "slug": "bankin",
   "source": "git@github.com:konnectors/bankin.git",
@@ -57,7 +58,7 @@
       "type": "io.cozy.bank.operations"
     },
     "accounts": {
-      "description": "Required to get/save the account's data",
+      "description": "Required to get/save the account's data, including the data collected by the client side part",
       "type": "io.cozy.accounts"
     },
     "bank.balancehistories": {
@@ -67,6 +68,10 @@
     "files": {
       "description": "Required to save the account statements",
       "type": "io.cozy.files"
+    },
+    "jobs": {
+      "description": "Required by the client side part to run the server side part which saves the bank documents",
+      "type": "io.cozy.jobs"
     }
   },
   "developer": {

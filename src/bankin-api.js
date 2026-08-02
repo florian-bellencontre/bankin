@@ -1,7 +1,10 @@
 const { requestFactory, errors, log } = require('cozy-konnector-libs')
 
-const accountTypeMapping = require('./account-type-mapping')
-const operationCategoryMapping = require('./operation-category-mapping')
+const {
+  formatBanks,
+  formatAccounts,
+  formatOperations
+} = require('./bankin-format')
 
 const request = requestFactory({
   // the debug mode shows all the details about http request and responses. Very useful for
@@ -13,16 +16,24 @@ const request = requestFactory({
   // default in cozy-konnector-libs
   json: true,
   // this allows request-promise to keep cookies between requests
-  jar: true
+  jar: true,
+  // Bankin API rejects (403) requests without user agent, 'true' will send a random realistic one
+  userAgent: true
 })
 
 module.exports = class BankinApi {
-  constructor({ clientId, clientSecret, email, password }, { bankinDeviceId }) {
+  constructor(
+    { clientId, clientSecret, email, password },
+    { bankinDeviceId, bankinAccessToken }
+  ) {
     this.clientId = clientId
     this.clientSecret = clientSecret
     this.email = email
     this.password = password
     this.bankinDeviceId = bankinDeviceId
+    // Token harvested by the companion CliSK connector, which is the only way
+    // past the captcha; see the comment in authenticate().
+    this.savedAccessToken = bankinAccessToken
     this.baseUrl = 'https://sync.bankin.com'
     this.bankinVersion = '2018-06-15'
     this.accessToken = ''
@@ -73,27 +84,74 @@ module.exports = class BankinApi {
       log('info', 'Successfully generated device id')
     }
 
-    log('info', 'Authenticating ...')
-    await this.authenticate()
-    log('info', 'Successfully logged in')
+    // A token saved by a previous run is worth trying first: since Bankin' put
+    // an hCaptcha in front of /v2/authenticate, a password login from a server
+    // is rejected outright, so a manually provided token is the only way in.
+    if (this.savedAccessToken) {
+      log('info', 'Trying the access token saved by a previous run ...')
+      this.accessToken = this.savedAccessToken
+      if (await this.isTokenValid()) {
+        log('info', 'Saved access token is still valid')
+      } else {
+        log('warn', 'Saved access token is no longer valid')
+        this.accessToken = ''
+      }
+    }
+
+    if (!this.accessToken) {
+      log('info', 'Authenticating ...')
+      await this.authenticate()
+      log('info', 'Successfully logged in')
+    }
 
     log('info', 'Fetching banks')
     await this.fetchBanks()
     log('info', `Found #${Object.keys(this.banks).length} banks`)
   }
 
+  /**
+   * Cheapest authenticated call we have, used to tell an expired token from a
+   * working one before we start a full sync.
+   */
+  async isTokenValid() {
+    try {
+      await request({
+        url: `${this.baseUrl}/v2/accounts`,
+        qs: {
+          client_id: this.clientId,
+          client_secret: this.clientSecret,
+          limit: 1
+        },
+        method: 'GET',
+        headers: {
+          'bankin-version': this.bankinVersion,
+          'bankin-device': this.bankinDeviceId,
+          authorization: `Bearer ${this.accessToken}`
+        }
+      })
+      return true
+    } catch (error) {
+      return false
+    }
+  }
+
   async authenticate() {
     const url = `${this.baseUrl}/v2/authenticate`
     const qs = {
       client_id: this.clientId,
-      client_secret: this.clientSecret,
-      email: this.email,
-      password: this.password
+      client_secret: this.clientSecret
     }
 
     const options = {
       url,
       qs,
+      // Since 2025 the endpoint is a new service that reads the credentials
+      // from a JSON body; sending them as query parameters returns a 400.
+      body: {
+        email: this.email,
+        password: this.password
+      },
+      json: true,
       method: 'POST',
       headers: {
         'bankin-version': this.bankinVersion,
@@ -107,8 +165,30 @@ module.exports = class BankinApi {
       this.accessToken = tokens.access_token
       return tokens
     } catch (error) {
+      // Bankin' now gates the login behind an hCaptcha challenge, which cannot
+      // be solved by a server-side connector. It is a hard gate: even a wrong
+      // password gets this same answer, so there is no way around it.
+      if (this.isChallengeError(error)) {
+        log(
+          'error',
+          "Bankin' asks for a captcha, which cannot be solved from a server. " +
+            'Run the "Bankin\' (connexion)" connector first: it opens the login ' +
+            'page so you can sign in, and stores the resulting token for this one.'
+        )
+        throw new Error(errors.CHALLENGE_ASKED)
+      }
+
       throw new Error(errors.LOGIN_FAILED)
     }
+  }
+
+  isChallengeError(error) {
+    const body = (error && error.error) || {}
+    return (
+      error.statusCode === 401 &&
+      (body.error_code === 'challenge_required' ||
+        String(error.message || '').includes('challenge_required'))
+    )
   }
 
   async fetchAllOperations() {
@@ -182,25 +262,12 @@ module.exports = class BankinApi {
     try {
       const response = await request(options)
 
-      this.banks = this.formatBanks(response.resources)
+      this.banks = formatBanks(response.resources)
       return this.banks
     } catch (error) {
+      log('error', `Could not fetch the banks: ${error.message}`)
       throw new Error(errors.VENDOR_DOWN)
     }
-  }
-
-  formatBanks(countries) {
-    let banks = {}
-
-    countries.forEach(country => {
-      country.parent_banks.forEach(parentBank => {
-        parentBank.banks.forEach(bank => {
-          banks[bank.id] = bank
-        })
-      })
-    })
-
-    return banks
   }
 
   async fetchAccounts() {
@@ -224,32 +291,11 @@ module.exports = class BankinApi {
     try {
       const response = await request(options)
 
-      return this.formatAccounts(response.resources)
+      return formatAccounts(response.resources, this.banks)
     } catch (error) {
+      log('error', `Could not fetch the accounts: ${error.message}`)
       throw new Error(errors.VENDOR_DOWN)
     }
-  }
-
-  formatAccounts(accounts) {
-    return accounts.map(account => {
-      let bank = 'none'
-
-      if (account.bank.id in this.banks) {
-        bank = this.banks[account.bank.id].name
-      }
-
-      return {
-        label: account.name,
-        institutionLabel: bank,
-        balance: account.balance,
-        type:
-          account.type in accountTypeMapping
-            ? accountTypeMapping[account.type]
-            : 'none',
-        number: String(account.id),
-        vendorId: String(account.id)
-      }
-    })
   }
 
   async fetchOperations(account) {
@@ -275,7 +321,7 @@ module.exports = class BankinApi {
     do {
       const response = await request(options)
 
-      operations = [...operations, ...this.formatOperations(response.resources)]
+      operations = [...operations, ...formatOperations(response.resources)]
       hasNext = false
 
       if (response.pagination.next_uri) {
@@ -285,28 +331,5 @@ module.exports = class BankinApi {
     } while (hasNext)
 
     return operations
-  }
-
-  formatOperations(operations) {
-    return operations.map(operation => {
-      const category =
-        operation.category.id in operationCategoryMapping
-          ? operationCategoryMapping[operation.category.id].cozyCategoryId
-          : 0
-
-      return {
-        date: operation.date,
-        label: operation.description,
-        originalLabel: operation.raw_description,
-        type: 'none',
-        automaticCategoryId: category,
-        dateImport: new Date(),
-        dateOperation: new Date(operation.date),
-        currency: operation.currency_code,
-        vendorAccountId: String(operation.account.id),
-        vendorId: operation.id,
-        amount: operation.amount
-      }
-    })
   }
 }
