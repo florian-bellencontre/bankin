@@ -70,39 +70,9 @@ async function start() {
 
   let importFailed = false
   try {
-    // Save one account at a time: BankingReconciliator throws when a
-    // transaction has no matching account, so a single unknown account would
-    // otherwise discard the whole run.
-    const savedAccounts = []
-    for (const account of accounts) {
-      const accountOperations = operationsByAccount[account.vendorId]
-      if (!accountOperations) {
-        log('warn', `No operation for account ${account.vendorId}, skipping`)
-        continue
-      }
-      log(
-        'info',
-        `Saving account ${account.vendorId} with ` +
-          `#${accountOperations.length} operations`
-      )
-      // useSplitDate: false, or nothing older than a week ever gets written.
-      // The reconciliator otherwise takes the most recent transaction already
-      // saved, walks back seven days, and silently discards every fetched
-      // operation older than that (getMissedTransactions, whose `oldestDate`
-      // variable actually holds the *newest* date). Backfilling a hole is
-      // exactly the case it throws away: the client part goes and gets three
-      // missing months, hands them over, and they never reach CouchDB.
-      // Disabling it is safe — reconciliate still recognises what is already
-      // there by vendorId, which Bankin' gives us, so nothing is duplicated.
-      const { accounts: saved } = await reconciliator.save(
-        [account],
-        accountOperations,
-        { useSplitDate: false }
-      )
-      savedAccounts.push(saved[0])
-    }
-    // Operations whose account was not returned by the API would make the
-    // reconciliator throw, so point them out rather than losing them silently.
+    // Operations whose account was not returned by the API are what makes the
+    // reconciliator throw, so leave them out — and say so, rather than losing
+    // them silently.
     const knownIds = accounts.map(account => account.vendorId)
     const orphans = Object.keys(operationsByAccount).filter(
       id => !knownIds.includes(id)
@@ -114,6 +84,48 @@ async function start() {
           ', '
         )}`
       )
+    }
+    for (const account of accounts) {
+      if (!operationsByAccount[account.vendorId]) {
+        log('warn', `No operation for account ${account.vendorId}, skipping`)
+      }
+    }
+
+    // One single call, not one per account. reconciliator.save() reloads the
+    // whole transaction collection (BankTransaction.fetchAll) every time it
+    // runs, so looping made the server reload it once per account — 22 times
+    // per batch here, which is where the thirty seconds went. Passing every
+    // account at once is safe now that the orphans above are left out: an
+    // orphan transaction is the only thing that makes it throw.
+    const accountsToSave = accounts.filter(
+      account => operationsByAccount[account.vendorId]
+    )
+    const operationsToSave = accountsToSave.reduce(
+      (all, account) => all.concat(operationsByAccount[account.vendorId]),
+      []
+    )
+    let savedAccounts = []
+    if (accountsToSave.length) {
+      log(
+        'info',
+        `Saving #${accountsToSave.length} accounts with ` +
+          `#${operationsToSave.length} operations`
+      )
+      // useSplitDate: false, or nothing older than a week ever gets written.
+      // The reconciliator otherwise takes the most recent transaction already
+      // saved, walks back seven days, and silently discards every fetched
+      // operation older than that (getMissedTransactions, whose `oldestDate`
+      // variable actually holds the *newest* date). Backfilling a hole is
+      // exactly the case it throws away: the client part goes and gets three
+      // missing months, hands them over, and they never reach CouchDB.
+      // Disabling it is safe — reconciliate still recognises what is already
+      // there by vendorId, which Bankin' gives us, so nothing is duplicated.
+      const { accounts: saved } = await reconciliator.save(
+        accountsToSave,
+        operationsToSave,
+        { useSplitDate: false }
+      )
+      savedAccounts = saved
     }
     log('info', `Saved #${savedAccounts.length} accounts`)
     const balances = await fetchBalances(savedAccounts)
@@ -103029,7 +103041,7 @@ function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = 
 
 const fs = __webpack_require__(480);
 const path = __webpack_require__(478);
-let manifest = typeof {"version":"2.7.2","name":"Bankin'","type":"konnector","language":"node","clientSide":true,"cookie_domains":["app2.bankin.com"],"icon":"icon.png","slug":"bankin","source":"git@github.com:konnectors/bankin.git","editor":"Cozy","vendor_link":"https://bankin.com/","categories":["banking"],"frequency":"daily","fields":{"email":{"type":"text","label":"fields.email.label"},"password":{"type":"password","label":"fields.password.label"},"advancedFields":{"folderPath":{"advanced":true,"isRequired":false},"clientId":{"type":"text","advanced":true,"isRequired":false,"label":"fields.clientId.label","description":"fields.clientId.description"},"clientSecret":{"type":"text","advanced":true,"isRequired":false,"label":"fields.clientSecret.label","description":"fields.clientSecret.description"}}},"data_types":["bankAccounts","bankTransactions"],"screenshots":[],"permissions":{"bank.accounts":{"description":"Required to save the list of bank accounts","type":"io.cozy.bank.accounts"},"bank.operations":{"description":"Required to save your bank operations","type":"io.cozy.bank.operations"},"accounts":{"description":"Required to get/save the account's data, including the data collected by the client side part","type":"io.cozy.accounts"},"bank.balancehistories":{"description":"Required to save balance histories","type":"io.cozy.bank.balancehistories"},"files":{"description":"Required to save the account statements","type":"io.cozy.files"},"jobs":{"description":"Required by the client side part to run the server side part which saves the bank documents","type":"io.cozy.jobs"}},"developer":{"name":"Naji Astier","url":"https://github.com/na-ji"},"langs":["fr","en"],"locales":{"fr":{"short_description":"Récupère vos opérations bancaires","long_description":"Récupère vos opérations bancaires","permissions":{"bank.accounts":{"description":"Utilisé pour sauvegarder la liste de vos comptes bancaires"},"bank.balancehistories":{"description":"Utilisé pour sauvegarder les historiques de solde"}},"fields":{"email":{"label":"Adresse email"},"password":{"label":"Mot de passe"},"clientId":{"label":"Client ID (optionnel)","description":"Client ID pour se connecter à l'API Bankin'. Possiblité d'avoir son propre Client sur https://bridgeapi.io/"},"clientSecret":{"label":"Client Secret (optionnel)","description":"Client Secret pour se connecter à l'API Bankin'. Possiblité d'avoir son propre Client sur https://bridgeapi.io/"}}},"en":{"short_description":"Retrieves your bank operations","long_description":"Retrieves your bank operations","permissions":{"bank.accounts":{"description":"Used to save the list of bank accounts"},"bank.balancehistories":{"description":"Required to save balance histories"}},"fields":{"email":{"label":"Email address"},"password":{"label":"Password"},"clientId":{"label":"Client ID (optional)","description":"Client ID to use Bankin' API. Possibility to create your client on https://bridgeapi.io/"},"clientSecret":{"label":"Client Secret (optional)","description":"Client Secret to use Bankin' API. Possibility to create your client on https://bridgeapi.io/"}}}},"manifest_version":"2"} === 'undefined' ? {} : {"version":"2.7.2","name":"Bankin'","type":"konnector","language":"node","clientSide":true,"cookie_domains":["app2.bankin.com"],"icon":"icon.png","slug":"bankin","source":"git@github.com:konnectors/bankin.git","editor":"Cozy","vendor_link":"https://bankin.com/","categories":["banking"],"frequency":"daily","fields":{"email":{"type":"text","label":"fields.email.label"},"password":{"type":"password","label":"fields.password.label"},"advancedFields":{"folderPath":{"advanced":true,"isRequired":false},"clientId":{"type":"text","advanced":true,"isRequired":false,"label":"fields.clientId.label","description":"fields.clientId.description"},"clientSecret":{"type":"text","advanced":true,"isRequired":false,"label":"fields.clientSecret.label","description":"fields.clientSecret.description"}}},"data_types":["bankAccounts","bankTransactions"],"screenshots":[],"permissions":{"bank.accounts":{"description":"Required to save the list of bank accounts","type":"io.cozy.bank.accounts"},"bank.operations":{"description":"Required to save your bank operations","type":"io.cozy.bank.operations"},"accounts":{"description":"Required to get/save the account's data, including the data collected by the client side part","type":"io.cozy.accounts"},"bank.balancehistories":{"description":"Required to save balance histories","type":"io.cozy.bank.balancehistories"},"files":{"description":"Required to save the account statements","type":"io.cozy.files"},"jobs":{"description":"Required by the client side part to run the server side part which saves the bank documents","type":"io.cozy.jobs"}},"developer":{"name":"Naji Astier","url":"https://github.com/na-ji"},"langs":["fr","en"],"locales":{"fr":{"short_description":"Récupère vos opérations bancaires","long_description":"Récupère vos opérations bancaires","permissions":{"bank.accounts":{"description":"Utilisé pour sauvegarder la liste de vos comptes bancaires"},"bank.balancehistories":{"description":"Utilisé pour sauvegarder les historiques de solde"}},"fields":{"email":{"label":"Adresse email"},"password":{"label":"Mot de passe"},"clientId":{"label":"Client ID (optionnel)","description":"Client ID pour se connecter à l'API Bankin'. Possiblité d'avoir son propre Client sur https://bridgeapi.io/"},"clientSecret":{"label":"Client Secret (optionnel)","description":"Client Secret pour se connecter à l'API Bankin'. Possiblité d'avoir son propre Client sur https://bridgeapi.io/"}}},"en":{"short_description":"Retrieves your bank operations","long_description":"Retrieves your bank operations","permissions":{"bank.accounts":{"description":"Used to save the list of bank accounts"},"bank.balancehistories":{"description":"Required to save balance histories"}},"fields":{"email":{"label":"Email address"},"password":{"label":"Password"},"clientId":{"label":"Client ID (optional)","description":"Client ID to use Bankin' API. Possibility to create your client on https://bridgeapi.io/"},"clientSecret":{"label":"Client Secret (optional)","description":"Client Secret to use Bankin' API. Possibility to create your client on https://bridgeapi.io/"}}}},"manifest_version":"2"};
+let manifest = typeof {"version":"2.8.0","name":"Bankin'","type":"konnector","language":"node","clientSide":true,"cookie_domains":["app2.bankin.com"],"icon":"icon.png","slug":"bankin","source":"git@github.com:konnectors/bankin.git","editor":"Cozy","vendor_link":"https://bankin.com/","categories":["banking"],"frequency":"daily","fields":{"email":{"type":"text","label":"fields.email.label"},"password":{"type":"password","label":"fields.password.label"},"advancedFields":{"folderPath":{"advanced":true,"isRequired":false},"clientId":{"type":"text","advanced":true,"isRequired":false,"label":"fields.clientId.label","description":"fields.clientId.description"},"clientSecret":{"type":"text","advanced":true,"isRequired":false,"label":"fields.clientSecret.label","description":"fields.clientSecret.description"}}},"data_types":["bankAccounts","bankTransactions"],"screenshots":[],"permissions":{"bank.accounts":{"description":"Required to save the list of bank accounts","type":"io.cozy.bank.accounts"},"bank.operations":{"description":"Required to save your bank operations","type":"io.cozy.bank.operations"},"accounts":{"description":"Required to get/save the account's data, including the data collected by the client side part","type":"io.cozy.accounts"},"bank.balancehistories":{"description":"Required to save balance histories","type":"io.cozy.bank.balancehistories"},"files":{"description":"Required to save the account statements","type":"io.cozy.files"},"jobs":{"description":"Required by the client side part to run the server side part which saves the bank documents","type":"io.cozy.jobs"}},"developer":{"name":"Naji Astier","url":"https://github.com/na-ji"},"langs":["fr","en"],"locales":{"fr":{"short_description":"Récupère vos opérations bancaires","long_description":"Récupère vos opérations bancaires","permissions":{"bank.accounts":{"description":"Utilisé pour sauvegarder la liste de vos comptes bancaires"},"bank.balancehistories":{"description":"Utilisé pour sauvegarder les historiques de solde"}},"fields":{"email":{"label":"Adresse email"},"password":{"label":"Mot de passe"},"clientId":{"label":"Client ID (optionnel)","description":"Client ID pour se connecter à l'API Bankin'. Possiblité d'avoir son propre Client sur https://bridgeapi.io/"},"clientSecret":{"label":"Client Secret (optionnel)","description":"Client Secret pour se connecter à l'API Bankin'. Possiblité d'avoir son propre Client sur https://bridgeapi.io/"}}},"en":{"short_description":"Retrieves your bank operations","long_description":"Retrieves your bank operations","permissions":{"bank.accounts":{"description":"Used to save the list of bank accounts"},"bank.balancehistories":{"description":"Required to save balance histories"}},"fields":{"email":{"label":"Email address"},"password":{"label":"Password"},"clientId":{"label":"Client ID (optional)","description":"Client ID to use Bankin' API. Possibility to create your client on https://bridgeapi.io/"},"clientSecret":{"label":"Client Secret (optional)","description":"Client Secret to use Bankin' API. Possibility to create your client on https://bridgeapi.io/"}}}},"manifest_version":"2"} === 'undefined' ? {} : {"version":"2.8.0","name":"Bankin'","type":"konnector","language":"node","clientSide":true,"cookie_domains":["app2.bankin.com"],"icon":"icon.png","slug":"bankin","source":"git@github.com:konnectors/bankin.git","editor":"Cozy","vendor_link":"https://bankin.com/","categories":["banking"],"frequency":"daily","fields":{"email":{"type":"text","label":"fields.email.label"},"password":{"type":"password","label":"fields.password.label"},"advancedFields":{"folderPath":{"advanced":true,"isRequired":false},"clientId":{"type":"text","advanced":true,"isRequired":false,"label":"fields.clientId.label","description":"fields.clientId.description"},"clientSecret":{"type":"text","advanced":true,"isRequired":false,"label":"fields.clientSecret.label","description":"fields.clientSecret.description"}}},"data_types":["bankAccounts","bankTransactions"],"screenshots":[],"permissions":{"bank.accounts":{"description":"Required to save the list of bank accounts","type":"io.cozy.bank.accounts"},"bank.operations":{"description":"Required to save your bank operations","type":"io.cozy.bank.operations"},"accounts":{"description":"Required to get/save the account's data, including the data collected by the client side part","type":"io.cozy.accounts"},"bank.balancehistories":{"description":"Required to save balance histories","type":"io.cozy.bank.balancehistories"},"files":{"description":"Required to save the account statements","type":"io.cozy.files"},"jobs":{"description":"Required by the client side part to run the server side part which saves the bank documents","type":"io.cozy.jobs"}},"developer":{"name":"Naji Astier","url":"https://github.com/na-ji"},"langs":["fr","en"],"locales":{"fr":{"short_description":"Récupère vos opérations bancaires","long_description":"Récupère vos opérations bancaires","permissions":{"bank.accounts":{"description":"Utilisé pour sauvegarder la liste de vos comptes bancaires"},"bank.balancehistories":{"description":"Utilisé pour sauvegarder les historiques de solde"}},"fields":{"email":{"label":"Adresse email"},"password":{"label":"Mot de passe"},"clientId":{"label":"Client ID (optionnel)","description":"Client ID pour se connecter à l'API Bankin'. Possiblité d'avoir son propre Client sur https://bridgeapi.io/"},"clientSecret":{"label":"Client Secret (optionnel)","description":"Client Secret pour se connecter à l'API Bankin'. Possiblité d'avoir son propre Client sur https://bridgeapi.io/"}}},"en":{"short_description":"Retrieves your bank operations","long_description":"Retrieves your bank operations","permissions":{"bank.accounts":{"description":"Used to save the list of bank accounts"},"bank.balancehistories":{"description":"Required to save balance histories"}},"fields":{"email":{"label":"Email address"},"password":{"label":"Password"},"clientId":{"label":"Client ID (optional)","description":"Client ID to use Bankin' API. Possibility to create your client on https://bridgeapi.io/"},"clientSecret":{"label":"Client Secret (optional)","description":"Client Secret to use Bankin' API. Possibility to create your client on https://bridgeapi.io/"}}}},"manifest_version":"2"};
 if (process.env.NODE_ENV !== undefined && process.env.NODE_ENV !== 'none' && process.env.NODE_ENV !== 'production') {
   try {
     manifest = getManifestFromFile();
