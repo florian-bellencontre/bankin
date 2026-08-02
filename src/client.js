@@ -159,6 +159,23 @@ class BankinContentScript extends ContentScript {
   }
 
   /**
+   * The API client id/secret. They can be baked into the build, but a public
+   * build has none, so they are also read from the saved credentials, where
+   * fetch() stores whatever the user filled in the advanced fields.
+   */
+  // P
+  async getApiCredentials() {
+    const credentials = await this.getCredentials()
+    if (credentials && credentials.clientId && credentials.clientSecret) {
+      return {
+        clientId: credentials.clientId,
+        clientSecret: credentials.clientSecret
+      }
+    }
+    return null
+  }
+
+  /**
    * Last resort when the token cannot be seen from the page: the launcher can
    * read the native cookie jar, which also holds the HttpOnly cookies.
    * Only the pilot can call it, hence this being here and not in the worker.
@@ -210,7 +227,11 @@ class BankinContentScript extends ContentScript {
     const token =
       (await this.runInWorker('findAccessToken')) ||
       (await this.findTokenInNativeCookies())
-    const email = await this.runInWorker('getUserEmail', token)
+    const email = await this.runInWorker(
+      'getUserEmail',
+      token,
+      await this.getApiCredentials()
+    )
     if (email) {
       this.log('info', 'Identifier taken from the API')
       return { sourceAccountIdentifier: normalizeEmail(email) }
@@ -234,10 +255,11 @@ class BankinContentScript extends ContentScript {
   }
 
   // W
-  async getUserEmail(givenToken) {
+  async getUserEmail(givenToken, givenApiClient) {
     const token = givenToken || this.findAccessToken()
     if (!token) return null
-    const { clientId, clientSecret } = this.getApiClient()
+    const { clientId, clientSecret } = this.getApiClient(givenApiClient)
+    if (!clientId || !clientSecret) return null
     // Never throw from here: the caller has a fallback on the email typed in
     // the login form, and losing the identifier would abort the whole run.
     try {
@@ -274,12 +296,27 @@ class BankinContentScript extends ContentScript {
     // getUserDataFromWebsite). The password is only stored so the account
     // behaves like other konnectors; it is never replayed, the captcha
     // makes an automatic login impossible anyway.
-    if (this.store && this.store.email) {
+    //
+    // The API client id/secret are kept here too: they live in the phone
+    // keychain, never in the published bundle. They come from the account
+    // fields, which the launcher wipes from auth once it writes accountName,
+    // so this is the only place they survive from one run to the next.
+    const previousCredentials = (await this.getCredentials()) || {}
+    const accountAuth = (context.account && context.account.auth) || {}
+    const credentials = {
+      ...previousCredentials,
+      ...(this.store && this.store.email ? { email: this.store.email } : {}),
+      ...(this.store && this.store.password
+        ? { password: this.store.password }
+        : {}),
+      ...(accountAuth.clientId ? { clientId: accountAuth.clientId } : {}),
+      ...(accountAuth.clientSecret
+        ? { clientSecret: accountAuth.clientSecret }
+        : {})
+    }
+    if (Object.keys(credentials).length) {
       try {
-        await this.saveCredentials({
-          email: this.store.email,
-          password: this.store.password
-        })
+        await this.saveCredentials(credentials)
       } catch (err) {
         this.log('warn', `Could not save the credentials: ${err.message}`)
       }
@@ -319,10 +356,32 @@ class BankinContentScript extends ContentScript {
     // runInWorker resolves to false when the worker reloaded mid-call, so
     // retry once rather than reporting a fetch failure.
     const deviceId = (this.store && this.store.deviceId) || ''
-    let bankinData = await this.runInWorker('fetchBankinData', token, deviceId)
+    const apiClient = await this.getApiCredentials()
+    this.log(
+      'info',
+      `API client: ${
+        apiClient ? 'from the saved credentials' : 'from the build'
+      }`
+    )
+    let bankinData = await this.runInWorker(
+      'fetchBankinData',
+      token,
+      deviceId,
+      apiClient
+    )
     if (bankinData === false) {
-      this.log('warn', 'The worker reloaded during the fetch, retrying once')
-      bankinData = await this.runInWorker('fetchBankinData', token, deviceId)
+      this.log('warn', 'The worker returned false, retrying once')
+      bankinData = await this.runInWorker(
+        'fetchBankinData',
+        token,
+        deviceId,
+        apiClient
+      )
+    }
+    // the worker reports its failures as data, an exception would cross the
+    // bridge as a bare "false" and lose the message
+    if (bankinData && bankinData.error) {
+      throw new Error(bankinData.error)
     }
     if (!bankinData || !bankinData.accounts) {
       throw new Error(
@@ -419,7 +478,10 @@ class BankinContentScript extends ContentScript {
   }
 
   // W
-  async fetchBankinData(givenToken, givenDeviceId) {
+  async fetchBankinData(givenToken, givenDeviceId, givenApiClient) {
+    // First thing, before anything can throw: prove the method really ran.
+    // A silent failure here used to surface as an unexplained "false".
+    this.log('info', '📍️ fetchBankinData starts (in the worker)')
     // the pilot passes the token it managed to find, so that a HttpOnly
     // cookie invisible from here does not stop the run
     const token = givenToken || this.findAccessToken()
@@ -445,12 +507,14 @@ class BankinContentScript extends ContentScript {
           'Bankin may reject the requests'
       )
     }
-    const { clientId, clientSecret } = this.getApiClient()
+    const { clientId, clientSecret } = this.getApiClient(givenApiClient)
     if (!clientId || !clientSecret) {
-      throw new Error(
-        'No API client id/secret available: the konnector was built without ' +
-          'DEFAULT_CLIENT_ID/DEFAULT_CLIENT_SECRET'
-      )
+      return {
+        error:
+          'No Bankin API client id/secret available. This build has none ' +
+          'baked in, and none were found in the saved credentials. Fill the ' +
+          '"Client ID"/"Client Secret" advanced fields of the account.'
+      }
     }
 
     const call = async path => {
@@ -608,11 +672,16 @@ class BankinContentScript extends ContentScript {
     return guessed ? guessed.value : null
   }
 
+  /**
+   * The API client credentials. They are baked in at build time, but a build
+   * made without them still works if the pilot found them in the keychain
+   * (see fetch), which keeps them out of a public bundle.
+   */
   // W
-  getApiClient() {
+  getApiClient(given) {
     return {
-      clientId: DEFAULT_CLIENT_ID,
-      clientSecret: DEFAULT_CLIENT_SECRET
+      clientId: (given && given.clientId) || DEFAULT_CLIENT_ID,
+      clientSecret: (given && given.clientSecret) || DEFAULT_CLIENT_SECRET
     }
   }
 }
