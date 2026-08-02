@@ -273,11 +273,29 @@ class BankinContentScript extends ContentScript {
     }
     await this.goto(`${baseUrl}/signin`)
     await this.waitForElementInWorker('#signin_email')
+    // Make sure of it: if a token is still visible here, the login form
+    // would return immediately and the run would fail much later, far from
+    // the cause.
+    if (await this.runInWorker('checkAuthenticated')) {
+      this.log(
+        'warn',
+        'A token is still visible after clearing the session; the login ' +
+          'form may not wait for a real sign in'
+      )
+    }
   }
 
   // W
   async wipeSessionCookies() {
-    for (const name of SESSION_COOKIES) {
+    // Every cookie the app owns, not just the ones we know by name: a
+    // leftover would be mistaken for a token by findAccessToken.
+    const names = new Set([
+      ...SESSION_COOKIES,
+      ...this.getCookies()
+        .map(cookie => cookie.name)
+        .filter(name => /^bw[A-Za-z]{2}$/.test(name))
+    ])
+    for (const name of names) {
       document.cookie = `${name}=;path=/;expires=Thu, 01 Jan 1970 00:00:00 GMT`
     }
     try {
@@ -1190,11 +1208,18 @@ class BankinContentScript extends ContentScript {
     const known =
       this.getCookie(ACCESS_TOKEN_COOKIE) || this.readStorage('ACCESS_TOKEN')
     if (known) return known
+    // Guessing by shape was meant to survive a rename, but it happily picks
+    // up any leftover long value — an analytics id, a Bankin session id —
+    // and calls it a token. That made "logged out" look like "logged in",
+    // so the login form returned at once and the run failed later. Only
+    // consider entries whose name looks like the app's own (bw + 2 letters),
+    // which is what a rename would still produce.
     const guessed = [...this.getCookies(), ...this.storageEntries()].find(
       entry =>
+        /^bw[A-Za-z]{2}$/.test(entry.name) &&
+        !/^(bwLg|bwAm|bwCk|bwPs|bwDi)$/.test(entry.name) &&
         entry.value.length >= 20 &&
-        !UUID_RE.test(entry.value) &&
-        !/^(bwLg|bwAm|bwCk|bwPs)$/.test(entry.name)
+        !UUID_RE.test(entry.value)
     )
     return guessed ? guessed.value : null
   }
