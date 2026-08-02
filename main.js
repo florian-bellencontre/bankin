@@ -7270,6 +7270,11 @@ const splitOperations = (bankinData, size) => {
   return batches
 }
 
+// The access token lives two hours (maxAge 0x1c20 in the app bundle). It is
+// written back with exactly that lifetime, and never restored once older,
+// so the page cannot end up holding a token that outlived its validity.
+const TOKEN_LIFETIME_SECONDS = 7200
+
 // After a login the app needs a moment to store its session; poll instead of
 // trusting the first value the page exposes.
 const SESSION_READY_ATTEMPTS = 6
@@ -7613,6 +7618,19 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
         this.log('warn', `Could not save the cookie ${cookie.name}`)
       }
     }
+    if (saved) {
+      // Remember when: a token older than its two hour life must not be put
+      // back, it would be read as the current session and refused.
+      try {
+        const credentials = (await this.getCredentials()) || {}
+        await this.saveCredentials({
+          ...credentials,
+          sessionSavedAt: String(Date.now())
+        })
+      } catch (err) {
+        this.log('warn', `Could not record the session date: ${err.message}`)
+      }
+    }
     this.log('info', `Saved ${saved} session cookie(s) for the next run`)
     return saved > 0
   }
@@ -7624,6 +7642,23 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
   // P
   async restoreSession() {
     this.log('info', 'Looking for a saved session')
+    // Skip the whole dance when the saved session cannot possibly still be
+    // valid: restoring a dead token only gets it read back as the current
+    // one, and the API then answers expired_token on a fresh login.
+    const credentials = (await this.getCredentials()) || {}
+    const savedAt = Number(credentials.sessionSavedAt || 0)
+    if (savedAt) {
+      const ageSeconds = Math.round((Date.now() - savedAt) / 1000)
+      if (ageSeconds > TOKEN_LIFETIME_SECONDS) {
+        this.log(
+          'info',
+          `The saved session is ${Math.round(ageSeconds / 60)} min old, ` +
+            'past its two hour life: not restoring it'
+        )
+        return false
+      }
+      this.log('info', `The saved session is ${ageSeconds}s old`)
+    }
     const restored = []
     for (const name of SESSION_COOKIES) {
       let cookie
@@ -7679,11 +7714,12 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
   // W
   async writeSessionCookies(cookies) {
     for (const cookie of cookies) {
-      // one year, like the web app does for its device cookie; the access
-      // token has its own two hour lifetime server side anyway
+      // Two hours, exactly like the app does: writing the token with a one
+      // year lifetime made it outlive its own validity in the page, so a
+      // later run kept reading a long-dead token instead of the fresh one.
       document.cookie = `${cookie.name}=${encodeURIComponent(
         cookie.value
-      )};path=/;max-age=31536000`
+      )};path=/;max-age=${TOKEN_LIFETIME_SECONDS}`
       // put the token back where the app looks for it too
       if (cookie.name === ACCESS_TOKEN_COOKIE) {
         try {
