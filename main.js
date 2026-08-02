@@ -7247,6 +7247,25 @@ const HOLE_GAP_DAYS = 10
 // this much per run instead of pulling everything at once.
 const BACKFILL_DAYS = 180
 
+// CouchDB refuses documents above 8 MB and the payload rides in the account
+// document; ~370 bytes per operation leaves plenty of room at this size.
+const MAX_OPERATIONS_PER_BATCH = 5000
+
+/**
+ * Cut the collected data into slices small enough for the account document.
+ * Every slice carries all the accounts: the server part needs them to attach
+ * the operations, and they are tiny compared to the operations.
+ */
+const splitOperations = (bankinData, size) => {
+  const { accounts, allOperations } = bankinData
+  if (allOperations.length <= size) return [bankinData]
+  const batches = []
+  for (let i = 0; i < allOperations.length; i += size) {
+    batches.push({ accounts, allOperations: allOperations.slice(i, i + size) })
+  }
+  return batches
+}
+
 const dateMinusDays = (day, count) => {
   const date = new Date(`${day}T00:00:00Z`)
   date.setUTCDate(date.getUTCDate() - count)
@@ -7293,17 +7312,27 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     await this.goto(baseUrl)
     await this.waitForElementInWorker('#signin_email, #root')
 
+    // A token in the page only means a session was opened at some point. It
+    // lives two hours, and an expired one still looks perfectly valid from
+    // here, so ask the API whether it is actually still good — otherwise the
+    // run goes all the way to the first API call before failing on a 401.
     if (await this.runInWorker('checkAuthenticated')) {
-      this.log('info', 'Already authenticated')
-      await this.saveSession()
-      return true
+      if (await this.isSessionUsable()) {
+        this.log('info', 'Already authenticated')
+        await this.saveSession()
+        return true
+      }
+      this.log('info', 'A session is present but the API rejects it')
     }
 
     // The webview starts blank on every run, so put back the session saved
     // last time before asking anything: as long as it holds, the user has
     // nothing to do.
     if (await this.restoreSession()) {
-      if (await this.runInWorker('checkAuthenticated')) {
+      if (
+        (await this.runInWorker('checkAuthenticated')) &&
+        (await this.isSessionUsable())
+      ) {
         this.log('info', 'Session restored, no need to sign in again')
         return true
       }
@@ -7316,6 +7345,55 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     await this.showLoginFormAndWaitForAuthentication()
     await this.saveSession()
     return true
+  }
+
+  /**
+   * Is the session in the page still accepted by the API? The token expires
+   * after two hours and nothing in the page says so, so ask the cheapest
+   * authenticated endpoint. A network problem answers "yes" on purpose: it
+   * is better to try the run than to send the user through a captcha for
+   * what may be a passing glitch.
+   */
+  // P
+  async isSessionUsable() {
+    const token = await this.runInWorker('findAccessToken')
+    if (!token) return false
+    const apiClient = await this.getApiCredentials()
+    const status = await this.runInWorker('checkToken', token, apiClient)
+    if (status === 'ok') return true
+    if (status === 'expired') {
+      this.log('info', 'The access token is no longer accepted')
+      return false
+    }
+    this.log('warn', `Could not check the token (${status}), trying anyway`)
+    return true
+  }
+
+  /**
+   * Ask the API whether the token still works. Returns 'ok', 'expired' or a
+   * short reason, never throws: an exception would reach the pilot as a bare
+   * "false" and be indistinguishable from an expired token.
+   */
+  // W
+  async checkToken(token, apiClient) {
+    const { clientId, clientSecret } = this.getApiClient(apiClient)
+    if (!clientId || !clientSecret) return 'no api client'
+    try {
+      const response = await window.fetch(`${apiUrl}/v2/users/me`, {
+        headers: {
+          'Bankin-Version': bankinVersion,
+          'Bankin-Device': this.findDeviceId(),
+          'Client-Id': clientId,
+          'Client-Secret': clientSecret,
+          Authorization: `Bearer ${token}`
+        }
+      })
+      if (response.ok) return 'ok'
+      if (response.status === 401 || response.status === 403) return 'expired'
+      return `http ${response.status}`
+    } catch (err) {
+      return `network: ${err.message}`
+    }
   }
 
   /**
@@ -7907,6 +7985,15 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       throw new Error(bankinData.error)
     }
     if (!bankinData || !bankinData.accounts) {
+      // A session that expired between the check and here is by far the most
+      // common cause, and it is not something the user can act on beyond
+      // running the konnector again.
+      if (!(await this.isSessionUsable())) {
+        throw new Error(
+          'The Bankin session expired during the run (the token only lives ' +
+            'two hours). Run the konnector again and sign in.'
+        )
+      }
       throw new Error(
         'Could not fetch the accounts from the Bankin API ' +
           `(the worker returned ${JSON.stringify(bankinData)}). If this is ` +
@@ -7926,20 +8013,41 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     }
 
     // Hand the data over to the server part, which owns the bank doctypes:
-    // the clisk bridge cannot write io.cozy.bank.* itself. The payload travels
-    // through the account document, so keep an eye on its size.
+    // the clisk bridge cannot write io.cozy.bank.* itself. The payload
+    // travels through the account document, and CouchDB refuses documents
+    // above 8 MB, so send it in slices when the history gets long.
     const payloadSize = JSON.stringify(bankinData).length
     this.log(
       'info',
-      `Handing ${Math.round(payloadSize / 1024)} KB over to the server part`
+      `${Math.round(payloadSize / 1024)} KB to hand over to the server part`
     )
-    if (payloadSize > 2 * 1024 * 1024) {
+    const batches = splitOperations(bankinData, MAX_OPERATIONS_PER_BATCH)
+    if (batches.length > 1) {
       this.log(
-        'warn',
-        'The payload is above 2 MB, the account document may be rejected'
+        'info',
+        `Sending it in ${batches.length} batches to stay under the document ` +
+          'size limit'
       )
     }
+    for (const [index, batch] of batches.entries()) {
+      if (batches.length > 1) {
+        this.log(
+          'info',
+          `Batch ${index + 1}/${batches.length}: ` +
+            `${batch.allOperations.length} operations`
+        )
+      }
+      await this.sendToServer(context, batch)
+    }
+    return
+  }
 
+  /**
+   * Give one slice of the collected data to the server part and wait for it
+   * to be written.
+   */
+  // P
+  async sendToServer(context, bankinData) {
     // saveAccountData and runServerJob are exposed by the flagship launcher
     // (see ReactNativeLauncher exposedMethodsNames) but cozy-clisk has no
     // wrapper for them, so go through the bridge like its own methods do.
@@ -8062,7 +8170,9 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
         } catch (err) {
           detail = ''
         }
-        throw new Error(`${path} answered ${response.status}${detail}`)
+        const error = new Error(`${path} answered ${response.status}${detail}`)
+        error.status = response.status
+        throw error
       }
       return response.json()
     }
@@ -8231,6 +8341,7 @@ connector
       'fetchBankinData',
       'findAccessToken',
       'readWebAppApiClient',
+      'checkToken',
       'readSessionCookies',
       'writeSessionCookies'
     ]
