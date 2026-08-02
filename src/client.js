@@ -32,8 +32,10 @@ const ACCESS_TOKEN_COOKIE = 'bwAt'
 const DEVICE_ID_COOKIE = 'bwDi'
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-// The web client sends its credentials to a public API client; the account
-// can override it with its own through the advanced fields.
+// No API client is hardcoded here. It is read at runtime from the Bankin' web
+// app itself (see readWebAppApiClient): the app ships its client to every
+// visitor, so the konnector picks it up the same way instead of carrying a
+// copy. The account fields and a build-time value still take precedence.
 const DEFAULT_CLIENT_ID = process.env.DEFAULT_CLIENT_ID
 const DEFAULT_CLIENT_SECRET = process.env.DEFAULT_CLIENT_SECRET
 
@@ -159,20 +161,59 @@ class BankinContentScript extends ContentScript {
   }
 
   /**
-   * The API client id/secret. They can be baked into the build, but a public
-   * build has none, so they are also read from the saved credentials, where
-   * fetch() stores whatever the user filled in the advanced fields.
+   * The API client id/secret, in order of preference:
+   *  1. the account's advanced fields, kept in the phone keychain
+   *  2. the Bankin' web app itself, which ships its own client to every
+   *     visitor (see readWebAppApiClient)
+   * Nothing is hardcoded in this konnector.
    */
   // P
   async getApiCredentials() {
     const credentials = await this.getCredentials()
     if (credentials && credentials.clientId && credentials.clientSecret) {
+      this.log('info', 'API client from the account fields')
       return {
         clientId: credentials.clientId,
         clientSecret: credentials.clientSecret
       }
     }
+    const fromWebApp = await this.runInWorker('readWebAppApiClient')
+    if (fromWebApp && fromWebApp.clientId && fromWebApp.clientSecret) {
+      this.log('info', 'API client read from the Bankin web app')
+      return fromWebApp
+    }
+    this.log('warn', 'Could not determine the API client')
     return null
+  }
+
+  /**
+   * Read the API client out of the web app's own javascript bundle. The app
+   * declares it next to the API base url, and its client secret is the only
+   * 64 character literal of the bundle. Doing it at runtime keeps those
+   * values out of this repository, and follows Bankin' if they rotate them.
+   */
+  // W
+  async readWebAppApiClient() {
+    try {
+      const scripts = [...document.querySelectorAll('script[src]')]
+        .map(script => script.src)
+        .filter(src => src.includes('/static/js/'))
+      for (const src of scripts) {
+        const source = await window.fetch(src).then(response => response.text())
+        // '<api url>','<32 hex client id>'
+        const idMatch = source.match(
+          /sync\.bankin\.com\/v2['"],\s*['"]([0-9a-f]{32})['"]/
+        )
+        if (!idMatch) continue
+        const secretMatch = source.match(/['"]([0-9a-zA-Z]{64})['"]/)
+        if (!secretMatch) continue
+        return { clientId: idMatch[1], clientSecret: secretMatch[1] }
+      }
+      return null
+    } catch (err) {
+      this.log('warn', `Could not read the web app api client: ${err.message}`)
+      return null
+    }
   }
 
   /**
@@ -263,18 +304,15 @@ class BankinContentScript extends ContentScript {
     // Never throw from here: the caller has a fallback on the email typed in
     // the login form, and losing the identifier would abort the whole run.
     try {
-      const response = await window.fetch(
-        `${apiUrl}/v2/users/me?client_id=${encodeURIComponent(
-          clientId
-        )}&client_secret=${encodeURIComponent(clientSecret)}`,
-        {
-          headers: {
-            'bankin-version': bankinVersion,
-            'bankin-device': this.findDeviceId(),
-            authorization: `Bearer ${token}`
-          }
+      const response = await window.fetch(`${apiUrl}/v2/users/me`, {
+        headers: {
+          'Bankin-Version': bankinVersion,
+          'Bankin-Device': this.findDeviceId(),
+          'Client-Id': clientId,
+          'Client-Secret': clientSecret,
+          Authorization: `Bearer ${token}`
         }
-      )
+      })
       if (!response.ok) {
         this.log('warn', `/v2/users/me answered ${response.status}`)
         return null
@@ -509,25 +547,25 @@ class BankinContentScript extends ContentScript {
     }
     const { clientId, clientSecret } = this.getApiClient(givenApiClient)
     if (!clientId || !clientSecret) {
+      // Should not happen, the web app client is used by default; this only
+      // triggers if someone empties both the constants and the fields.
       return {
         error:
-          'No Bankin API client id/secret available. This build has none ' +
-          'baked in, and none were found in the saved credentials. Fill the ' +
-          '"Client ID"/"Client Secret" advanced fields of the account.'
+          'No Bankin API client id/secret available. Fill the "Client ID" ' +
+          'and "Client Secret" advanced fields of the account.'
       }
     }
 
+    // Same shape as the web app's own requests: the client goes in headers,
+    // not in the query string (read from its bundle).
     const call = async path => {
-      const separator = path.includes('?') ? '&' : '?'
-      const url =
-        `${apiUrl}${path}${separator}client_id=${encodeURIComponent(
-          clientId
-        )}` + `&client_secret=${encodeURIComponent(clientSecret)}`
-      const response = await window.fetch(url, {
+      const response = await window.fetch(`${apiUrl}${path}`, {
         headers: {
-          'bankin-version': bankinVersion,
-          'bankin-device': deviceId,
-          authorization: `Bearer ${token}`
+          'Bankin-Version': bankinVersion,
+          'Bankin-Device': deviceId,
+          'Client-Id': clientId,
+          'Client-Secret': clientSecret,
+          Authorization: `Bearer ${token}`
         }
       })
       if (!response.ok) {
@@ -693,7 +731,8 @@ connector
       'checkAuthenticated',
       'getUserEmail',
       'fetchBankinData',
-      'findAccessToken'
+      'findAccessToken',
+      'readWebAppApiClient'
     ]
   })
   .catch(err => {
