@@ -117,6 +117,11 @@ class BankinContentScript extends ContentScript {
     await this.goto(baseUrl)
     await this.waitForElementInWorker('#signin_email, #root')
 
+    // Grab the API client now, while a page of the app is loaded: it lives in
+    // the app bundle, which is not reachable from the login page, and every
+    // check below needs it.
+    await this.getApiCredentials()
+
     // A token in the page only means a session was opened at some point. It
     // lives two hours, and an expired one still looks perfectly valid from
     // here, so ask the API whether it is actually still good — otherwise the
@@ -176,6 +181,13 @@ class BankinContentScript extends ContentScript {
     if (status === 'ok') return true
     if (status === 'expired') {
       this.log('info', 'The access token is no longer accepted')
+      return false
+    }
+    if (status === 'no api client') {
+      // Not a verdict on the token: we simply could not ask. Saying "usable"
+      // here would let an expired session through and fail later, in the
+      // middle of the fetch, so treat it as unusable and let the user log in.
+      this.log('warn', 'No API client to check the token with, asking to login')
       return false
     }
     this.log('warn', `Could not check the token (${status}), trying anyway`)
@@ -462,19 +474,36 @@ class BankinContentScript extends ContentScript {
    */
   // P
   async getApiCredentials() {
+    // Read once per run: it is asked for at several points, and reading it
+    // depends on the page currently loaded — from /signin the app bundle is
+    // not reachable, and a miss there used to silently disable the token
+    // check.
+    if (this.apiCredentials) return this.apiCredentials
+
     const credentials = await this.getCredentials()
     if (credentials && credentials.clientId && credentials.clientSecret) {
-      this.log('info', 'API client from the account fields')
-      return {
+      this.log('info', 'API client from the saved credentials')
+      this.apiCredentials = {
         clientId: credentials.clientId,
         clientSecret: credentials.clientSecret
       }
+      return this.apiCredentials
     }
+
     const fromWebApp = await this.runInWorker('readWebAppApiClient')
     if (fromWebApp && fromWebApp.clientId && fromWebApp.clientSecret) {
       this.log('info', 'API client read from the Bankin web app')
-      return fromWebApp
+      this.apiCredentials = fromWebApp
+      // Keep it for the next runs: the app bundle is only readable from its
+      // own pages, and this saves re-downloading it every time.
+      try {
+        await this.saveCredentials({ ...(credentials || {}), ...fromWebApp })
+      } catch (err) {
+        this.log('warn', `Could not keep the API client: ${err.message}`)
+      }
+      return this.apiCredentials
     }
+
     this.log('warn', 'Could not determine the API client')
     return null
   }
