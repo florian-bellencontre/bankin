@@ -34,7 +34,12 @@ const DEVICE_ID_COOKIE = 'bwDi'
 // restored: the API ties a token to the device it was issued for, so putting
 // an old device back in the page makes every freshly obtained token be
 // rejected. Let the app manage bwDi itself.
-const SESSION_COOKIES = ['bwAt', 'bwLg', 'bwPs']
+// The access token is deliberately absent. Writing it back creates a second
+// cookie of the same name — ours is host-only, the app's is set on the parent
+// domain — and document.cookie then returns ours, hiding the live session
+// behind a dead token. It only lives two hours anyway, so restoring it buys
+// almost nothing.
+const SESSION_COOKIES = ['bwLg', 'bwPs']
 // ...but it is still part of a session and must go when we drop one.
 const DEVICE_COOKIE_TO_WIPE = 'bwDi'
 const UUID_RE =
@@ -369,7 +374,10 @@ class BankinContentScript extends ContentScript {
         ...SESSION_COOKIES,
         ...this.getCookies()
           .map(cookie => cookie.name)
-          .filter(name => /^bw[A-Za-z]{2}$/.test(name))
+          .filter(name => /^bw[A-Za-z]{2}$/.test(name)),
+        // the access token is not in SESSION_COOKIES any more, but a copy
+        // written by an older version may still shadow the live one
+        ACCESS_TOKEN_COOKIE
       ].filter(name => name !== DEVICE_COOKIE_TO_WIPE)
     )
     // A cookie is only removed by an expiry that repeats its exact domain and
@@ -499,20 +507,6 @@ class BankinContentScript extends ContentScript {
         domain: window.location.hostname,
         path: '/'
       }))
-    // The app may keep the token in sessionStorage rather than in a cookie
-    // (it picks one or the other at runtime). Save it under the cookie name
-    // so a single mechanism covers both cases.
-    if (!cookies.some(cookie => cookie.name === ACCESS_TOKEN_COOKIE)) {
-      const stored = this.readStorage('ACCESS_TOKEN')
-      if (stored) {
-        cookies.push({
-          name: ACCESS_TOKEN_COOKIE,
-          value: stored,
-          domain: window.location.hostname,
-          path: '/'
-        })
-      }
-    }
     return cookies
   }
 
@@ -525,14 +519,6 @@ class BankinContentScript extends ContentScript {
       document.cookie = `${cookie.name}=${encodeURIComponent(
         cookie.value
       )};path=/;max-age=${TOKEN_LIFETIME_SECONDS}`
-      // put the token back where the app looks for it too
-      if (cookie.name === ACCESS_TOKEN_COOKIE) {
-        try {
-          window.sessionStorage.setItem('ACCESS_TOKEN', cookie.value)
-        } catch (err) {
-          // storage disabled, the cookie is enough
-        }
-      }
     }
     return true
   }
