@@ -7377,6 +7377,16 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     // failed programmatic login is exactly what gets an account flagged.
     this.log('info', 'Not authenticated, showing the login form')
     await this.showLoginFormAndWaitForAuthentication()
+    // Back to normal: incognito was only there to force a real login, and
+    // leaving it on would throw the fresh session away at the end of the run.
+    if (this.incognito) {
+      try {
+        await this.bridge.call('setIncognito', false)
+        this.incognito = false
+      } catch (err) {
+        this.log('warn', `Could not leave incognito: ${err.message}`)
+      }
+    }
     // Give the app a moment to finish settling its session: it writes its
     // cookies as the dashboard loads, and reading them too early gets the
     // half-written state — which is what a token refused milliseconds after
@@ -7544,16 +7554,27 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     }
     await this.goto(`${baseUrl}/signin`)
     await this.waitForElementInWorker('#signin_email')
-    // checkAuthenticated answers "no" on the login page whatever happens, so
-    // ask the worker directly whether a token survived. It is harmless now
-    // that the wait no longer depends on it, but it tells us the cookies were
-    // not expired properly.
+
+    // document.cookie only reaches the cookies the page can see; the webview
+    // keeps its own jar. When an expired token survives there, the app reads
+    // it on load, believes it is still signed in, never calls
+    // /v2/authenticate — and the user signs in on a form that hands back the
+    // very same dead token. Incognito is the only way to make the webview
+    // start from nothing.
     if (await this.runInWorker('findAccessToken')) {
       this.log(
-        'warn',
-        'A token survived the session clearing; it will be ignored, but the ' +
-          'cookies were not expired as expected'
+        'info',
+        'A token survived in the webview jar, restarting it incognito so the ' +
+          'app really signs in again'
       )
+      try {
+        await this.bridge.call('setIncognito', true)
+        this.incognito = true
+        await this.goto(`${baseUrl}/signin`)
+        await this.waitForElementInWorker('#signin_email')
+      } catch (err) {
+        this.log('warn', `Could not switch to incognito: ${err.message}`)
+      }
     }
   }
 
