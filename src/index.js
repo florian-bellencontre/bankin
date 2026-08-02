@@ -80,9 +80,19 @@ async function start() {
         `Saving account ${account.vendorId} with ` +
           `#${accountOperations.length} operations`
       )
+      // useSplitDate: false, or nothing older than a week ever gets written.
+      // The reconciliator otherwise takes the most recent transaction already
+      // saved, walks back seven days, and silently discards every fetched
+      // operation older than that (getMissedTransactions, whose `oldestDate`
+      // variable actually holds the *newest* date). Backfilling a hole is
+      // exactly the case it throws away: the client part goes and gets three
+      // missing months, hands them over, and they never reach CouchDB.
+      // Disabling it is safe — reconciliate still recognises what is already
+      // there by vendorId, which Bankin' gives us, so nothing is duplicated.
       const { accounts: saved } = await reconciliator.save(
         [account],
-        accountOperations
+        accountOperations,
+        { useSplitDate: false }
       )
       savedAccounts.push(saved[0])
     }
