@@ -7225,9 +7225,13 @@ const bankinVersion = '2018-06-15'
 // findAccessToken/findDeviceId fall back to recognising the value itself.
 const ACCESS_TOKEN_COOKIE = 'bwAt'
 const DEVICE_ID_COOKIE = 'bwDi'
-// Cookies that make up a Bankin session: the access token, the device id,
-// and the two the app sets alongside them.
-const SESSION_COOKIES = ['bwAt', 'bwDi', 'bwLg', 'bwPs']
+// Cookies that make up a Bankin session. The device id is deliberately NOT
+// restored: the API ties a token to the device it was issued for, so putting
+// an old device back in the page makes every freshly obtained token be
+// rejected. Let the app manage bwDi itself.
+const SESSION_COOKIES = ['bwAt', 'bwLg', 'bwPs']
+// ...but it is still part of a session and must go when we drop one.
+const DEVICE_COOKIE_TO_WIPE = 'bwDi'
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 // No API client is hardcoded here. It is read at runtime from the Bankin' web
@@ -7534,13 +7538,18 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
   // W
   async wipeSessionCookies() {
     // Every cookie the app owns, not just the ones we know by name: a
-    // leftover would be mistaken for a token by findAccessToken.
-    const names = new Set([
-      ...SESSION_COOKIES,
-      ...this.getCookies()
-        .map(cookie => cookie.name)
-        .filter(name => /^bw[A-Za-z]{2}$/.test(name))
-    ])
+    // leftover would be mistaken for a token by findAccessToken. The device
+    // id is kept: it identifies this webview to Bankin', a token is issued
+    // for it, and removing it makes the app register a new device on every
+    // login for nothing.
+    const names = new Set(
+      [
+        ...SESSION_COOKIES,
+        ...this.getCookies()
+          .map(cookie => cookie.name)
+          .filter(name => /^bw[A-Za-z]{2}$/.test(name))
+      ].filter(name => name !== DEVICE_COOKIE_TO_WIPE)
+    )
     // A cookie is only removed by an expiry that repeats its exact domain and
     // path. The app sets some of them on the bare host and others on the
     // parent domain, and document.cookie does not say which — so expire every
