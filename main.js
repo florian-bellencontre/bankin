@@ -8238,36 +8238,32 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       return null // no idea, take everything
     }
 
-    const days = [
-      ...new Set(
-        (operations || [])
-          .filter(operation => operation && operation.date)
-          .map(operation => String(operation.date).slice(0, 10))
-      )
+    const saved = (operations || []).filter(
+      operation => operation && operation.date
+    )
+    const allDays = [
+      ...new Set(saved.map(operation => String(operation.date).slice(0, 10)))
     ].sort()
 
-    if (!days.length) {
+    if (!allDays.length) {
       this.log('info', 'No operation saved yet, importing the whole history')
-      return null
+      return { fallback: null, byAccount: {} }
     }
 
-    const newest = days[days.length - 1]
-    const oldest = days[0]
-    let since = dateMinusDays(newest, ALWAYS_REFETCH_DAYS)
+    const newest = allDays[allDays.length - 1]
+    const oldest = allDays[0]
 
-    // A hole between two saved days: the bank did not simply stay quiet, a
-    // run was missed or was cut short.
-    for (let i = 1; i < days.length; i++) {
-      if (daysBetween(days[i - 1], days[i]) > HOLE_GAP_DAYS) {
-        const holeStart = dateMinusDays(days[i - 1], 1)
-        if (holeStart < since) since = holeStart
-        this.log(
-          'warn',
-          `Gap of more than ${HOLE_GAP_DAYS} days after ${days[i - 1]}, ` +
-            'going further back to fill it'
-        )
-        break
-      }
+    // Holes are looked for per account, not over all of them at once. With 22
+    // accounts, one of them missing three months is invisible in the union:
+    // the others keep every day covered, the calendar looks continuous, and
+    // nothing is ever refetched. That is exactly how a whole quarter can go
+    // missing from a single account while the logs report a healthy history.
+    const daysByAccount = new Map()
+    for (const operation of saved) {
+      const key = String(operation.vendorAccountId || '')
+      if (!key) continue
+      if (!daysByAccount.has(key)) daysByAccount.set(key, new Set())
+      daysByAccount.get(key).add(String(operation.date).slice(0, 10))
     }
 
     // The truncated past: previous versions only kept a 3 month window, so
@@ -8281,6 +8277,7 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     // here, the account simply has nothing before that date and there is no
     // point digging every run.
     const askedBefore = await this.getKnownHistoryStart()
+    let deepest = null
     if (askedBefore && askedBefore < oldest) {
       this.log(
         'info',
@@ -8288,20 +8285,49 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
           'for: nothing older to get'
       )
     } else {
-      const deeper = dateMinusDays(oldest, BACKFILL_DAYS)
-      if (deeper < since) since = deeper
-      await this.setKnownHistoryStart(deeper)
+      deepest = dateMinusDays(oldest, BACKFILL_DAYS)
+      await this.setKnownHistoryStart(deepest)
       this.log(
         'info',
-        `History starts at ${oldest}, reaching back to ${deeper} to extend it`
+        `History starts at ${oldest}, reaching back to ${deepest} to extend it`
       )
+    }
+
+    const byAccount = {}
+    let holes = 0
+    for (const [vendorAccountId, daySet] of daysByAccount) {
+      const days = [...daySet].sort()
+      let since = dateMinusDays(days[days.length - 1], ALWAYS_REFETCH_DAYS)
+      // A quiet stretch inside one account's own history: the bank did not
+      // simply move no money for that long, a run was missed or cut short.
+      for (let i = 1; i < days.length; i++) {
+        const gap = daysBetween(days[i - 1], days[i])
+        if (gap > HOLE_GAP_DAYS) {
+          const holeStart = dateMinusDays(days[i - 1], 1)
+          if (holeStart < since) since = holeStart
+          holes++
+          this.log(
+            'warn',
+            `Account ${vendorAccountId}: nothing between ${days[i - 1]} and ` +
+              `${days[i]} (${gap} days), going back there to fill the hole`
+          )
+          break
+        }
+      }
+      if (deepest && deepest < since) since = deepest
+      byAccount[vendorAccountId] = since
     }
 
     this.log(
       'info',
-      `${days.length} days saved (${oldest} to ${newest}), fetching from ${since}`
+      `${allDays.length} days saved (${oldest} to ${newest}) over ` +
+        `${daysByAccount.size} account(s), ${holes} with a hole to fill`
     )
-    return since
+    // Accounts with nothing saved — new ones, and the ones that never had a
+    // single operation — are not in the map and take the whole history. That
+    // costs one page for an empty account, and is the only way a genuinely
+    // new account gets imported in full.
+    return { fallback: null, byAccount }
   }
 
   /**
@@ -8551,7 +8577,7 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
   }
 
   // W
-  async fetchBankinData(givenToken, givenDeviceId, givenApiClient, since) {
+  async fetchBankinData(givenToken, givenDeviceId, givenApiClient, sinceSpec) {
     // First thing, before anything can throw: prove the method really ran.
     // A silent failure here used to surface as an unexplained "false".
     this.log('info', '📍️ fetchBankinData starts (in the worker)')
@@ -8634,8 +8660,18 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     )
     this.log('info', `Found ${accounts.length} accounts`)
 
+    const { fallback = null, byAccount = {} } = sinceSpec || {}
+
     let allOperations = []
     for (const account of accounts) {
+      // Each account has its own starting point: one of them missing a
+      // quarter must dig that far back without dragging the other 21 with it.
+      const since = Object.prototype.hasOwnProperty.call(
+        byAccount,
+        account.vendorId
+      )
+        ? byAccount[account.vendorId]
+        : fallback
       let path = `/v2/accounts/${account.vendorId}/transactions?limit=200`
       let pages = 0
       let stoppedEarly = false
@@ -8663,7 +8699,8 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
         'info',
         `Account ${account.vendorId}: ${allOperations.length - before} ` +
           `operations in ${pages} page(s)` +
-          (stoppedEarly ? ' (stopped, reached the known ones)' : '')
+          (since ? ` since ${since}` : ' (whole history)') +
+          (stoppedEarly ? ', stopped there' : '')
       )
     }
 
