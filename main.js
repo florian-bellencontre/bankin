@@ -7238,8 +7238,22 @@ const normalizeEmail = email => String(email).trim().toLowerCase()
 
 class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_MODULE_0__.ContentScript {
   // P
-  async ensureAuthenticated() {
+  async ensureAuthenticated({ account } = {}) {
     this.log('info', '📍️ ensureAuthenticated starts')
+
+    // An account created before this konnector became client-side has no
+    // auth.accountName. The launcher then compares our identifier to
+    // undefined, always disagrees, logs the user out and retries for ever
+    // (WRONG_ACCOUNT_IDENTIFIER). Nothing here can fix it — the check runs
+    // before the launcher writes the name — so at least say so out loud.
+    if (account && account._id && !(account.auth && account.auth.accountName)) {
+      this.log(
+        'warn',
+        'This account has no auth.accountName: the app will refuse every ' +
+          'identifier and keep logging you out. Delete the Bankin account in ' +
+          'the Cozy and add it again to get a clean one.'
+      )
+    }
 
     // Never log the user out first, unlike most konnectors: the session is
     // the only thing we have. Signing in again costs a captcha, and the token
@@ -7369,23 +7383,27 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
   }
 
   /**
-   * The launcher compares this to account.auth.accountName on EVERY run, and
-   * when they differ it logs the user out and starts over
-   * (WRONG_ACCOUNT_IDENTIFIER) — an endless login/logout loop. So the value
-   * must be rock stable across runs.
+   * The launcher compares this to account.auth.accountName on EVERY run and,
+   * when they differ, logs the user out and starts the authentication over
+   * (WRONG_ACCOUNT_IDENTIFIER) — an endless login/logout loop. The value must
+   * therefore be identical on every single run.
    *
-   * Hence the same order as the other konnectors: what the user typed first,
-   * then the saved credentials. The API is only a last resort, because a
-   * network answer is exactly the kind of thing that changes between runs.
+   * The API answer is the most reliable source here: it identifies the
+   * Bankin' account itself, while the login form is only filled in on the
+   * runs where the user actually signs in. The typed email is kept as a
+   * fallback for when the API cannot be reached.
    */
   // P
   async getUserDataFromWebsite() {
     this.log('info', '📍️ getUserDataFromWebsite starts')
 
-    const typedEmail = this.store && this.store.email
-    if (typedEmail) {
-      this.log('info', 'Identifier taken from the login form')
-      return { sourceAccountIdentifier: normalizeEmail(typedEmail) }
+    const token =
+      (await this.runInWorker('findAccessToken')) ||
+      (await this.findTokenInNativeCookies())
+    const email = await this.runInWorker('getUserEmail', token)
+    if (email) {
+      this.log('info', 'Identifier taken from the API')
+      return { sourceAccountIdentifier: normalizeEmail(email) }
     }
 
     const credentials = await this.getCredentials()
@@ -7394,15 +7412,10 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       return { sourceAccountIdentifier: normalizeEmail(credentials.email) }
     }
 
-    // Nothing local: ask the API who we are. This happens when the user was
-    // already logged in and never typed anything in the form.
-    const token =
-      (await this.runInWorker('findAccessToken')) ||
-      (await this.findTokenInNativeCookies())
-    const email = await this.runInWorker('getUserEmail', token)
-    if (email) {
-      this.log('info', 'Identifier taken from the API')
-      return { sourceAccountIdentifier: normalizeEmail(email) }
+    const typedEmail = this.store && this.store.email
+    if (typedEmail) {
+      this.log('info', 'Identifier taken from the login form')
+      return { sourceAccountIdentifier: normalizeEmail(typedEmail) }
     }
 
     throw new Error(
