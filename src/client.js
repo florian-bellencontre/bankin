@@ -30,6 +30,9 @@ const bankinVersion = '2018-06-15'
 // findAccessToken/findDeviceId fall back to recognising the value itself.
 const ACCESS_TOKEN_COOKIE = 'bwAt'
 const DEVICE_ID_COOKIE = 'bwDi'
+// Cookies that make up a Bankin session: the access token, the device id,
+// and the two the app sets alongside them.
+const SESSION_COOKIES = ['bwAt', 'bwDi', 'bwLg', 'bwPs']
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 // No API client is hardcoded here. It is read at runtime from the Bankin' web
@@ -47,6 +50,12 @@ class BankinContentScript extends ContentScript {
   // P
   async ensureAuthenticated({ account } = {}) {
     this.log('info', '📍️ ensureAuthenticated starts')
+
+    // Copy whatever the user filled in the account to the keychain, right
+    // away: the launcher overwrites auth with {accountName} as soon as it
+    // knows the identifier, so these values are only readable on the first
+    // runs, while they are needed on every one.
+    await this.keepAccountFields(account)
 
     // An account created before this konnector became client-side has no
     // auth.accountName. The launcher then compares our identifier to
@@ -70,13 +79,158 @@ class BankinContentScript extends ContentScript {
 
     if (await this.runInWorker('checkAuthenticated')) {
       this.log('info', 'Already authenticated')
+      await this.saveSession()
       return true
+    }
+
+    // The webview starts blank on every run, so put back the session saved
+    // last time before asking anything: as long as it holds, the user has
+    // nothing to do.
+    if (await this.restoreSession()) {
+      if (await this.runInWorker('checkAuthenticated')) {
+        this.log('info', 'Session restored, no need to sign in again')
+        return true
+      }
+      this.log('info', 'The saved session has expired')
     }
 
     // No autologin attempt on purpose: the captcha makes it pointless, and a
     // failed programmatic login is exactly what gets an account flagged.
     this.log('info', 'Not authenticated, showing the login form')
     await this.showLoginFormAndWaitForAuthentication()
+    await this.saveSession()
+    return true
+  }
+
+  /**
+   * The account fields (login, and the optional API client) only survive
+   * until the launcher rewrites auth with the account name, so copy them to
+   * the keychain while they can still be read.
+   */
+  // P
+  async keepAccountFields(account) {
+    const auth = (account && account.auth) || {}
+    const worth = ['login', 'email', 'password', 'clientId', 'clientSecret']
+      .filter(key => auth[key])
+      .reduce((kept, key) => {
+        kept[key === 'login' ? 'email' : key] = auth[key]
+        return kept
+      }, {})
+    if (!Object.keys(worth).length) return false
+    try {
+      const previous = (await this.getCredentials()) || {}
+      await this.saveCredentials({ ...previous, ...worth })
+      this.log(
+        'info',
+        `Kept the account fields: ${Object.keys(worth).join(', ')}`
+      )
+      return true
+    } catch (err) {
+      this.log('warn', `Could not keep the account fields: ${err.message}`)
+      return false
+    }
+  }
+
+  /**
+   * Keep the session cookies so the next run does not have to ask for a new
+   * login. They are stored in the phone keychain, per account.
+   */
+  // P
+  async saveSession() {
+    const cookies = await this.runInWorker('readSessionCookies')
+    if (!cookies || !cookies.length) {
+      this.log('info', 'No session cookie to save')
+      return false
+    }
+    let saved = 0
+    for (const cookie of cookies) {
+      try {
+        await this.bridge.call('saveCookieToKeychain', cookie)
+        saved++
+      } catch (err) {
+        this.log('warn', `Could not save the cookie ${cookie.name}`)
+      }
+    }
+    this.log('info', `Saved ${saved} session cookie(s) for the next run`)
+    return saved > 0
+  }
+
+  /**
+   * Put back the cookies saved by a previous run. Returns false when there is
+   * nothing to restore, so the caller knows a login is unavoidable.
+   */
+  // P
+  async restoreSession() {
+    this.log('info', 'Looking for a saved session')
+    const restored = []
+    for (const name of SESSION_COOKIES) {
+      let cookie
+      try {
+        cookie = await this.bridge.call('getCookieFromKeychainByName', name)
+      } catch (err) {
+        this.log('warn', `Could not read the saved cookie ${name}`)
+        continue
+      }
+      if (cookie && cookie.value) {
+        restored.push({ name, value: cookie.value })
+      }
+    }
+    if (!restored.length) {
+      this.log('info', 'No saved session')
+      return false
+    }
+    await this.runInWorker('writeSessionCookies', restored)
+    // the app reads its cookies on start, so reload for them to take effect
+    await this.goto(baseUrl)
+    await this.waitForElementInWorker('#signin_email, #root')
+    this.log('info', `Restored ${restored.length} session cookie(s)`)
+    return true
+  }
+
+  // W
+  async readSessionCookies() {
+    const cookies = this.getCookies()
+      .filter(cookie => SESSION_COOKIES.includes(cookie.name))
+      .map(cookie => ({
+        name: cookie.name,
+        value: cookie.value,
+        domain: window.location.hostname,
+        path: '/'
+      }))
+    // The app may keep the token in sessionStorage rather than in a cookie
+    // (it picks one or the other at runtime). Save it under the cookie name
+    // so a single mechanism covers both cases.
+    if (!cookies.some(cookie => cookie.name === ACCESS_TOKEN_COOKIE)) {
+      const stored = this.readStorage('ACCESS_TOKEN')
+      if (stored) {
+        cookies.push({
+          name: ACCESS_TOKEN_COOKIE,
+          value: stored,
+          domain: window.location.hostname,
+          path: '/'
+        })
+      }
+    }
+    return cookies
+  }
+
+  // W
+  async writeSessionCookies(cookies) {
+    for (const cookie of cookies) {
+      // one year, like the web app does for its device cookie; the access
+      // token has its own two hour lifetime server side anyway
+      document.cookie = `${cookie.name}=${encodeURIComponent(
+        cookie.value
+      )};path=/;max-age=31536000`
+      // put the token back where the app looks for it too
+      if (cookie.name === ACCESS_TOKEN_COOKIE) {
+        try {
+          window.sessionStorage.setItem('ACCESS_TOKEN', cookie.value)
+        } catch (err) {
+          // storage disabled, the cookie is enough
+        }
+      }
+    }
     return true
   }
 
@@ -732,7 +886,9 @@ connector
       'getUserEmail',
       'fetchBankinData',
       'findAccessToken',
-      'readWebAppApiClient'
+      'readWebAppApiClient',
+      'readSessionCookies',
+      'writeSessionCookies'
     ]
   })
   .catch(err => {
