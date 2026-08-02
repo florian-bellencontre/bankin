@@ -7327,7 +7327,12 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     // in sessionStorage, and it may even be HttpOnly, in which case the page
     // cannot see it at all and the login would never be detected. Leaving the
     // signin page is the reliable signal.
-    if (this.findAccessToken()) {
+    const token = this.findAccessToken()
+    if (token) {
+      // Hand it to the pilot immediately. This method is polled during the
+      // login, so we are on the live session page here; later on any
+      // navigation would wipe the sessionStorage that holds it.
+      this.sendToPilot({ accessToken: token, deviceId: this.findDeviceId() })
       return true
     }
     const onSignInPage =
@@ -7475,24 +7480,23 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       }
     }
 
-    // Settle the worker on a stable page first. Right after the login the
-    // webview is still navigating, and a call made during a reload makes the
-    // launcher's runInWorker return false instead of a result.
-    await this.goto(baseUrl)
-    await this.waitForElementInWorker('#root')
-
-    // The worker reads the token from the page (cookie or sessionStorage). If
-    // it cannot see it — a HttpOnly cookie is invisible to javascript — fall
-    // back on the native cookie jar, which only the pilot can read.
-    let token = await this.runInWorker('findAccessToken')
-    if (token === false) {
-      // not "no token": the worker reloaded mid-call
-      this.log('warn', 'The worker reloaded, asking for the token again')
-      await this.waitForElementInWorker('#root')
+    // Do NOT navigate before reading the token: the app keeps it in
+    // sessionStorage, which is wiped by a reload, and the token grabbed
+    // during the authentication is the one we want.
+    let token = this.store && this.store.accessToken
+    if (token) {
+      this.log('info', 'Using the token captured during the authentication')
+    } else {
+      this.log('info', 'No token captured yet, asking the worker')
       token = await this.runInWorker('findAccessToken')
+      if (token === false) {
+        // not "no token": the worker reloaded mid-call
+        this.log('warn', 'The worker reloaded, asking for the token again')
+        token = await this.runInWorker('findAccessToken')
+      }
     }
     if (token) {
-      this.log('info', 'Access token found from the page')
+      this.log('info', 'Access token available')
     } else {
       this.log('info', 'No token visible from the page, trying the cookie jar')
       token = await this.findTokenInNativeCookies()
@@ -7509,11 +7513,11 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     // Collect everything from the webview, i.e. from the user's own IP.
     // runInWorker resolves to false when the worker reloaded mid-call, so
     // retry once rather than reporting a fetch failure.
-    let bankinData = await this.runInWorker('fetchBankinData', token)
+    const deviceId = (this.store && this.store.deviceId) || ''
+    let bankinData = await this.runInWorker('fetchBankinData', token, deviceId)
     if (bankinData === false) {
       this.log('warn', 'The worker reloaded during the fetch, retrying once')
-      await this.waitForElementInWorker('#root')
-      bankinData = await this.runInWorker('fetchBankinData', token)
+      bankinData = await this.runInWorker('fetchBankinData', token, deviceId)
     }
     if (!bankinData || !bankinData.accounts) {
       throw new Error(
@@ -7610,7 +7614,7 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
   }
 
   // W
-  async fetchBankinData(givenToken) {
+  async fetchBankinData(givenToken, givenDeviceId) {
     // the pilot passes the token it managed to find, so that a HttpOnly
     // cookie invisible from here does not stop the run
     const token = givenToken || this.findAccessToken()
@@ -7626,7 +7630,9 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
           })`
       )
     }
-    const deviceId = this.findDeviceId()
+    // the pilot passes what it captured during the login: a navigation may
+    // have cleared the cookies this page can see
+    const deviceId = givenDeviceId || this.findDeviceId()
     if (!deviceId) {
       this.log(
         'warn',
