@@ -7322,7 +7322,10 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
         await this.saveSession()
         return true
       }
-      this.log('info', 'A session is present but the API rejects it')
+      // Same reason as below: a dead token left in the page would satisfy
+      // waitForAuthenticated straight away.
+      this.log('info', 'A session is present but the API rejects it, clearing')
+      await this.clearSession()
     }
 
     // The webview starts blank on every run, so put back the session saved
@@ -7336,7 +7339,12 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
         this.log('info', 'Session restored, no need to sign in again')
         return true
       }
-      this.log('info', 'The saved session has expired')
+      // Wipe what we just put back. Those cookies are dead, and leaving them
+      // in the page would make waitForAuthenticated — which polls
+      // checkAuthenticated, and a token is a token — return at once, as if
+      // the user had already signed in.
+      this.log('info', 'The saved session has expired, clearing it')
+      await this.clearSession()
     }
 
     // No autologin attempt on purpose: the captcha makes it pointless, and a
@@ -7423,6 +7431,38 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       this.log('warn', `Could not keep the account fields: ${err.message}`)
       return false
     }
+  }
+
+  /**
+   * Drop the session from the page. Used when a token turns out to be dead:
+   * leaving it there would fool waitForAuthenticated, which only looks for
+   * the presence of a token.
+   */
+  // P
+  async clearSession() {
+    await this.runInWorker('wipeSessionCookies')
+    // Forget the token captured earlier too, otherwise fetch() would happily
+    // reuse the expired one it was handed before the check.
+    if (this.store) {
+      delete this.store.accessToken
+      delete this.store.deviceId
+    }
+    await this.goto(`${baseUrl}/signin`)
+    await this.waitForElementInWorker('#signin_email')
+  }
+
+  // W
+  async wipeSessionCookies() {
+    for (const name of SESSION_COOKIES) {
+      document.cookie = `${name}=;path=/;expires=Thu, 01 Jan 1970 00:00:00 GMT`
+    }
+    try {
+      window.sessionStorage.removeItem('ACCESS_TOKEN')
+      window.localStorage.removeItem('ACCESS_TOKEN')
+    } catch (err) {
+      // storage disabled, the cookies were the important part
+    }
+    return true
   }
 
   /**
@@ -8343,7 +8383,8 @@ connector
       'readWebAppApiClient',
       'checkToken',
       'readSessionCookies',
-      'writeSessionCookies'
+      'writeSessionCookies',
+      'wipeSessionCookies'
     ]
   })
   .catch(err => {
