@@ -92,23 +92,73 @@ class BankinContentScript extends ContentScript {
         }
       })
     }
-    // The web app keeps its access token in a cookie; its presence is what
-    // tells the app itself that the user is logged in.
-    return Boolean(this.findAccessToken())
+    // Do not rely on the token alone: the app stores it either in a cookie or
+    // in sessionStorage, and it may even be HttpOnly, in which case the page
+    // cannot see it at all and the login would never be detected. Leaving the
+    // signin page is the reliable signal.
+    if (this.findAccessToken()) {
+      return true
+    }
+    const onSignInPage =
+      window.location.pathname.startsWith('/signin') ||
+      Boolean(document.querySelector('#signin_email'))
+    return !onSignInPage
   }
 
   // P
   async showLoginFormAndWaitForAuthentication() {
     this.log('info', '📍️ showLoginFormAndWaitForAuthentication starts')
     await this.setWorkerState({ visible: true })
-    await this.runInWorkerUntilTrue({ method: 'waitForAuthenticated' })
+    await this.runInWorkerUntilTrue({
+      method: 'waitForAuthenticated',
+      // the default timeout is short for a login that needs a captcha
+      timeout: 5 * 60 * 1000
+    })
     await this.setWorkerState({ visible: false })
+  }
+
+  /**
+   * Last resort when the token cannot be seen from the page: the launcher can
+   * read the native cookie jar, which also holds the HttpOnly cookies.
+   * Only the pilot can call it, hence this being here and not in the worker.
+   */
+  // P
+  async findTokenInNativeCookies() {
+    this.log('info', 'Looking for the token in the native cookie jar')
+    let cookies
+    try {
+      cookies = await this.bridge.call('getCookiesByDomain', 'app2.bankin.com')
+    } catch (err) {
+      this.log('warn', `Could not read the native cookies: ${err.message}`)
+      return null
+    }
+    const names = Object.keys(cookies || {})
+    this.log('info', `Native cookies: ${names.join(', ') || 'none'}`)
+    const valueOf = cookie =>
+      cookie && typeof cookie === 'object' ? cookie.value : cookie
+
+    const known = valueOf(cookies && cookies[ACCESS_TOKEN_COOKIE])
+    if (known) return known
+
+    const guessedName = names.find(name => {
+      const value = valueOf(cookies[name]) || ''
+      return (
+        value.length >= 20 &&
+        !UUID_RE.test(value) &&
+        !/^(bwLg|bwAm|bwCk|bwPs)$/.test(name)
+      )
+    })
+    return guessedName ? valueOf(cookies[guessedName]) : null
   }
 
   // P
   async getUserDataFromWebsite() {
     this.log('info', '📍️ getUserDataFromWebsite starts')
-    const email = await this.runInWorker('getUserEmail')
+    // same token dance as in fetch(): the page may not see a HttpOnly cookie
+    const token =
+      (await this.runInWorker('findAccessToken')) ||
+      (await this.findTokenInNativeCookies())
+    const email = await this.runInWorker('getUserEmail', token)
     if (email) {
       return { sourceAccountIdentifier: email }
     }
@@ -125,33 +175,62 @@ class BankinContentScript extends ContentScript {
   }
 
   // W
-  async getUserEmail() {
-    const token = this.findAccessToken()
+  async getUserEmail(givenToken) {
+    const token = givenToken || this.findAccessToken()
     if (!token) return null
     const { clientId, clientSecret } = this.getApiClient()
-    const response = await window.fetch(
-      `${apiUrl}/v2/users/me?client_id=${encodeURIComponent(
-        clientId
-      )}&client_secret=${encodeURIComponent(clientSecret)}`,
-      {
-        headers: {
-          'bankin-version': bankinVersion,
-          'bankin-device': this.findDeviceId(),
-          authorization: `Bearer ${token}`
+    // Never throw from here: the caller has a fallback on the email typed in
+    // the login form, and losing the identifier would abort the whole run.
+    try {
+      const response = await window.fetch(
+        `${apiUrl}/v2/users/me?client_id=${encodeURIComponent(
+          clientId
+        )}&client_secret=${encodeURIComponent(clientSecret)}`,
+        {
+          headers: {
+            'bankin-version': bankinVersion,
+            'bankin-device': this.findDeviceId(),
+            authorization: `Bearer ${token}`
+          }
         }
+      )
+      if (!response.ok) {
+        this.log('warn', `/v2/users/me answered ${response.status}`)
+        return null
       }
-    )
-    if (!response.ok) return null
-    const user = await response.json()
-    return user.email || null
+      const user = await response.json()
+      return user.email || null
+    } catch (err) {
+      this.log('warn', `Could not reach /v2/users/me: ${err.message}`)
+      return null
+    }
   }
 
   // P
   async fetch(context) {
     this.log('info', '📍️ fetch starts')
 
+    // The worker reads the token from the page (cookie or sessionStorage). If
+    // it cannot see it — a HttpOnly cookie is invisible to javascript — fall
+    // back on the native cookie jar, which only the pilot can read.
+    let token = await this.runInWorker('findAccessToken')
+    if (token) {
+      this.log('info', 'Access token found from the page')
+    } else {
+      this.log('info', 'No token visible from the page, trying the cookie jar')
+      token = await this.findTokenInNativeCookies()
+      if (!token) {
+        throw new Error(
+          'Could not find the Bankin access token, neither in the page nor ' +
+            'in the native cookies. The session may have expired: run the ' +
+            'konnector again and sign in.'
+        )
+      }
+      this.log('info', 'Access token found in the native cookie jar')
+    }
+
     // Collect everything from the webview, i.e. from the user's own IP.
-    const bankinData = await this.runInWorker('fetchBankinData')
+    const bankinData = await this.runInWorker('fetchBankinData', token)
     if (!bankinData || !bankinData.accounts) {
       throw new Error('Could not fetch the accounts from the Bankin API')
     }
@@ -230,14 +309,16 @@ class BankinContentScript extends ContentScript {
   }
 
   // W
-  async fetchBankinData() {
-    const token = this.findAccessToken()
+  async fetchBankinData(givenToken) {
+    // the pilot passes the token it managed to find, so that a HttpOnly
+    // cookie invisible from here does not stop the run
+    const token = givenToken || this.findAccessToken()
     if (!token) {
       // Most likely cause: the 2h token expired while the konnector was open.
       throw new Error(
-        'No access token found in the page cookies. Either the session ' +
-          'expired, or Bankin renamed its cookies (expected ' +
-          `"${ACCESS_TOKEN_COOKIE}", found: ${
+        'No access token found in the page. Either the session expired, or ' +
+          `Bankin renamed its storage (expected "${ACCESS_TOKEN_COOKIE}" or ` +
+          `an ACCESS_TOKEN entry, found cookies: ${
             this.getCookies()
               .map(cookie => cookie.name)
               .join(', ') || 'none'
@@ -346,30 +427,71 @@ class BankinContentScript extends ContentScript {
   }
 
   /**
+   * Depending on a runtime check, the web app stores its token either in a
+   * cookie or in sessionStorage under the literal key 'ACCESS_TOKEN'
+   * (see the bundle: `isXxx() ? sessionStorage.setItem('ACCESS_TOKEN', …)
+   * : cookies.set(ACCESS_TOKEN, …)`). Look in every place rather than
+   * betting on one.
+   */
+  // W
+  readStorage(key) {
+    for (const storage of [window.sessionStorage, window.localStorage]) {
+      try {
+        const value = storage && storage.getItem(key)
+        if (value) return value
+      } catch (err) {
+        // storage can throw when it is disabled, just skip it
+      }
+    }
+    return null
+  }
+
+  // W
+  storageEntries() {
+    const entries = []
+    for (const storage of [window.sessionStorage, window.localStorage]) {
+      try {
+        if (!storage) continue
+        for (let i = 0; i < storage.length; i++) {
+          const name = storage.key(i)
+          entries.push({ name, value: storage.getItem(name) || '' })
+        }
+      } catch (err) {
+        // ignore an unavailable storage
+      }
+    }
+    return entries
+  }
+
+  /**
    * The device id is a uuid, which makes it recognisable even if the cookie
    * gets renamed.
    */
   // W
   findDeviceId() {
-    const known = this.getCookie(DEVICE_ID_COOKIE)
+    const known =
+      this.getCookie(DEVICE_ID_COOKIE) || this.readStorage('DEVICE_ID')
     if (known) return known
-    const guessed = this.getCookies().find(cookie => UUID_RE.test(cookie.value))
+    const guessed = [...this.getCookies(), ...this.storageEntries()].find(
+      entry => UUID_RE.test(entry.value)
+    )
     return guessed ? guessed.value : ''
   }
 
   /**
-   * The access token is the only long opaque cookie left once the known short
+   * The access token is the only long opaque value left once the known short
    * ones (lang, analytics, device) are ruled out.
    */
   // W
   findAccessToken() {
-    const known = this.getCookie(ACCESS_TOKEN_COOKIE)
+    const known =
+      this.getCookie(ACCESS_TOKEN_COOKIE) || this.readStorage('ACCESS_TOKEN')
     if (known) return known
-    const guessed = this.getCookies().find(
-      cookie =>
-        cookie.value.length >= 20 &&
-        !UUID_RE.test(cookie.value) &&
-        !/^(bwLg|bwAm|bwCk|bwPs)$/.test(cookie.name)
+    const guessed = [...this.getCookies(), ...this.storageEntries()].find(
+      entry =>
+        entry.value.length >= 20 &&
+        !UUID_RE.test(entry.value) &&
+        !/^(bwLg|bwAm|bwCk|bwPs)$/.test(entry.name)
     )
     return guessed ? guessed.value : null
   }
@@ -390,8 +512,7 @@ connector
       'checkAuthenticated',
       'getUserEmail',
       'fetchBankinData',
-      'getCookie',
-      'getApiClient'
+      'findAccessToken'
     ]
   })
   .catch(err => {
