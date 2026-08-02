@@ -71,6 +71,13 @@ const splitOperations = (bankinData, size) => {
   return batches
 }
 
+// After a login the app needs a moment to store its session; poll instead of
+// trusting the first value the page exposes.
+const SESSION_READY_ATTEMPTS = 6
+const SESSION_READY_DELAY_MS = 1000
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+
 const dateMinusDays = (day, count) => {
   const date = new Date(`${day}T00:00:00Z`)
   date.setUTCDate(date.getUTCDate() - count)
@@ -161,8 +168,37 @@ class BankinContentScript extends ContentScript {
     // failed programmatic login is exactly what gets an account flagged.
     this.log('info', 'Not authenticated, showing the login form')
     await this.showLoginFormAndWaitForAuthentication()
+    // Give the app a moment to finish settling its session: it writes its
+    // cookies as the dashboard loads, and reading them too early gets the
+    // half-written state — which is what a token refused milliseconds after
+    // a successful login looks like.
+    await this.waitForSessionReady()
     await this.saveSession()
     return true
+  }
+
+  /**
+   * Wait until the session in the page is actually accepted by the API.
+   * Right after a login the app is still storing its token, so the first
+   * value readable from the page can be the previous one, or a partial one.
+   */
+  // P
+  async waitForSessionReady() {
+    for (let attempt = 1; attempt <= SESSION_READY_ATTEMPTS; attempt++) {
+      if (await this.isSessionUsable()) {
+        this.log('info', `Session ready after ${attempt} attempt(s)`)
+        return true
+      }
+      if (attempt < SESSION_READY_ATTEMPTS) {
+        await sleep(SESSION_READY_DELAY_MS)
+      }
+    }
+    this.log(
+      'warn',
+      'The session is still refused after the login; carrying on anyway, ' +
+        'the fetch will tell'
+    )
+    return false
   }
 
   /**
@@ -210,6 +246,20 @@ class BankinContentScript extends ContentScript {
   async checkToken(token, apiClient) {
     const { clientId, clientSecret } = this.getApiClient(apiClient)
     if (!clientId || !clientSecret) return 'no api client'
+    // Describe the token without ever logging it: when the API keeps
+    // refusing a freshly obtained one, the shape says whether we are even
+    // reading the right value.
+    this.log(
+      'info',
+      `Checking a token of ${String(token).length} chars ` +
+        `(${/^[\w-]+\.[\w-]+\.[\w-]+$/.test(token) ? 'jwt' : 'opaque'}), ` +
+        `device ${this.findDeviceId() ? 'present' : 'MISSING'}, ` +
+        `cookies: ${
+          this.getCookies()
+            .map(cookie => cookie.name)
+            .join(',') || 'none'
+        }`
+    )
     try {
       const response = await window.fetch(`${apiUrl}/v2/users/me`, {
         headers: {
