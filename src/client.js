@@ -280,10 +280,22 @@ class BankinContentScript extends ContentScript {
       }
     }
 
+    // Settle the worker on a stable page first. Right after the login the
+    // webview is still navigating, and a call made during a reload makes the
+    // launcher's runInWorker return false instead of a result.
+    await this.goto(baseUrl)
+    await this.waitForElementInWorker('#root')
+
     // The worker reads the token from the page (cookie or sessionStorage). If
     // it cannot see it — a HttpOnly cookie is invisible to javascript — fall
     // back on the native cookie jar, which only the pilot can read.
     let token = await this.runInWorker('findAccessToken')
+    if (token === false) {
+      // not "no token": the worker reloaded mid-call
+      this.log('warn', 'The worker reloaded, asking for the token again')
+      await this.waitForElementInWorker('#root')
+      token = await this.runInWorker('findAccessToken')
+    }
     if (token) {
       this.log('info', 'Access token found from the page')
     } else {
@@ -300,9 +312,20 @@ class BankinContentScript extends ContentScript {
     }
 
     // Collect everything from the webview, i.e. from the user's own IP.
-    const bankinData = await this.runInWorker('fetchBankinData', token)
+    // runInWorker resolves to false when the worker reloaded mid-call, so
+    // retry once rather than reporting a fetch failure.
+    let bankinData = await this.runInWorker('fetchBankinData', token)
+    if (bankinData === false) {
+      this.log('warn', 'The worker reloaded during the fetch, retrying once')
+      await this.waitForElementInWorker('#root')
+      bankinData = await this.runInWorker('fetchBankinData', token)
+    }
     if (!bankinData || !bankinData.accounts) {
-      throw new Error('Could not fetch the accounts from the Bankin API')
+      throw new Error(
+        'Could not fetch the accounts from the Bankin API ' +
+          `(the worker returned ${JSON.stringify(bankinData)}). If this is ` +
+          '"false", the webview reloaded while fetching.'
+      )
     }
     this.log(
       'info',
