@@ -7288,16 +7288,26 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
 
   // W
   async checkAuthenticated() {
-    // Watch the login field while the user types, so that the email is known
-    // even if /v2/users/me cannot be reached later.
-    const emailField = document.querySelector('#signin_email')
-    if (emailField && !emailField.dataset.cliskListener) {
-      emailField.dataset.cliskListener = '1'
-      emailField.addEventListener('change', () => {
-        if (emailField.value) {
-          this.sendToPilot({ email: emailField.value })
+    // Watch the login fields while the user types: their email is what gives
+    // a stable sourceAccountIdentifier. This method is polled during the
+    // login, so it doubles as the place to (re)install the listeners.
+    // 'input' as well as 'change': the app may submit before a change event
+    // is emitted, and then the page is gone.
+    for (const [selector, key] of [
+      ['#signin_email', 'email'],
+      ['#signin_password', 'password']
+    ]) {
+      const field = document.querySelector(selector)
+      if (field && !field.dataset.cliskListener) {
+        field.dataset.cliskListener = '1'
+        const send = () => {
+          if (field.value) {
+            this.sendToPilot({ [key]: field.value })
+          }
         }
-      })
+        field.addEventListener('input', send)
+        field.addEventListener('change', send)
+      }
     }
     // Do not rely on the token alone: the app stores it either in a cookie or
     // in sessionStorage, and it may even be HttpOnly, in which case the page
@@ -7359,15 +7369,33 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
   }
 
   /**
-   * The launcher compares this to account.auth.accountName on every run and
-   * logs the user out when they differ (WRONG_ACCOUNT_IDENTIFIER), so it has
-   * to be perfectly stable: always lowercased and trimmed, whether it comes
-   * from the API or from the login form.
+   * The launcher compares this to account.auth.accountName on EVERY run, and
+   * when they differ it logs the user out and starts over
+   * (WRONG_ACCOUNT_IDENTIFIER) — an endless login/logout loop. So the value
+   * must be rock stable across runs.
+   *
+   * Hence the same order as the other konnectors: what the user typed first,
+   * then the saved credentials. The API is only a last resort, because a
+   * network answer is exactly the kind of thing that changes between runs.
    */
   // P
   async getUserDataFromWebsite() {
     this.log('info', '📍️ getUserDataFromWebsite starts')
-    // same token dance as in fetch(): the page may not see a HttpOnly cookie
+
+    const typedEmail = this.store && this.store.email
+    if (typedEmail) {
+      this.log('info', 'Identifier taken from the login form')
+      return { sourceAccountIdentifier: normalizeEmail(typedEmail) }
+    }
+
+    const credentials = await this.getCredentials()
+    if (credentials && credentials.email) {
+      this.log('info', 'Identifier taken from the saved credentials')
+      return { sourceAccountIdentifier: normalizeEmail(credentials.email) }
+    }
+
+    // Nothing local: ask the API who we are. This happens when the user was
+    // already logged in and never typed anything in the form.
     const token =
       (await this.runInWorker('findAccessToken')) ||
       (await this.findTokenInNativeCookies())
@@ -7376,13 +7404,7 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       this.log('info', 'Identifier taken from the API')
       return { sourceAccountIdentifier: normalizeEmail(email) }
     }
-    // Fall back on what the user typed in the login form: losing the
-    // identifier here would abort a run that could otherwise succeed.
-    const typedEmail = this.store && this.store.email
-    if (typedEmail) {
-      this.log('info', 'Identifier taken from the login form')
-      return { sourceAccountIdentifier: normalizeEmail(typedEmail) }
-    }
+
     throw new Error(
       'Could not find the user email, cannot give a sourceAccountIdentifier'
     )
@@ -7423,6 +7445,22 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
   // P
   async fetch(context) {
     this.log('info', '📍️ fetch starts')
+
+    // Persist what the user typed, so that the next runs have a stable
+    // sourceAccountIdentifier even when nothing is typed (see
+    // getUserDataFromWebsite). The password is only stored so the account
+    // behaves like other konnectors; it is never replayed, the captcha
+    // makes an automatic login impossible anyway.
+    if (this.store && this.store.email) {
+      try {
+        await this.saveCredentials({
+          email: this.store.email,
+          password: this.store.password
+        })
+      } catch (err) {
+        this.log('warn', `Could not save the credentials: ${err.message}`)
+      }
+    }
 
     // The worker reads the token from the page (cookie or sessionStorage). If
     // it cannot see it — a HttpOnly cookie is invisible to javascript — fall
@@ -7495,19 +7533,32 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       throw err
     }
 
+    // The data is safe in the account from here on: even if the job below
+    // never runs, the next execution will import it.
     this.log('info', 'Starting the server job which saves the bank documents')
     let job
     try {
-      job = await this.bridge.call('runServerJob')
+      job = await Promise.race([
+        this.bridge.call('runServerJob', {}, { timeout: 10 * 60 * 1000 }),
+        // The launcher already started a job of its own for this konnector
+        // before calling fetch(); if the stack serialises them, waiting for
+        // ours could last forever. Do not hang the whole run on it.
+        new Promise((resolve, reject) =>
+          setTimeout(
+            () => reject(new Error('the server job did not finish in 10 min')),
+            10 * 60 * 1000
+          )
+        )
+      ])
     } catch (err) {
       // runServerJob is a fairly recent addition to the flagship app: on an
-      // older one the bridge simply has no such method, which would otherwise
-      // surface as an unhelpful "not a function"/timeout error.
+      // older one the bridge simply has no such method.
       this.log(
         'error',
         `The server job could not be run: ${err.message}. If this says the ` +
           'method is unknown, the Twake/Cozy app is too old for this ' +
-          'konnector: update it and run again.'
+          'konnector: update it and run again. The collected data has been ' +
+          'saved and will be imported by the next run.'
       )
       throw err
     }
