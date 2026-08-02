@@ -273,14 +273,15 @@ class BankinContentScript extends ContentScript {
     }
     await this.goto(`${baseUrl}/signin`)
     await this.waitForElementInWorker('#signin_email')
-    // Make sure of it: if a token is still visible here, the login form
-    // would return immediately and the run would fail much later, far from
-    // the cause.
-    if (await this.runInWorker('checkAuthenticated')) {
+    // checkAuthenticated answers "no" on the login page whatever happens, so
+    // ask the worker directly whether a token survived. It is harmless now
+    // that the wait no longer depends on it, but it tells us the cookies were
+    // not expired properly.
+    if (await this.runInWorker('findAccessToken')) {
       this.log(
         'warn',
-        'A token is still visible after clearing the session; the login ' +
-          'form may not wait for a real sign in'
+        'A token survived the session clearing; it will be ignored, but the ' +
+          'cookies were not expired as expected'
       )
     }
   }
@@ -295,8 +296,27 @@ class BankinContentScript extends ContentScript {
         .map(cookie => cookie.name)
         .filter(name => /^bw[A-Za-z]{2}$/.test(name))
     ])
+    // A cookie is only removed by an expiry that repeats its exact domain and
+    // path. The app sets some of them on the bare host and others on the
+    // parent domain, and document.cookie does not say which — so expire every
+    // combination.
+    const host = window.location.hostname
+    const domains = [
+      null, // no domain attribute: matches the ones set without it
+      host, // app2.bankin.com
+      `.${host}`,
+      host.split('.').slice(-2).join('.'), // bankin.com
+      `.${host.split('.').slice(-2).join('.')}`
+    ]
+    const past = 'expires=Thu, 01 Jan 1970 00:00:00 GMT'
     for (const name of names) {
-      document.cookie = `${name}=;path=/;expires=Thu, 01 Jan 1970 00:00:00 GMT`
+      for (const domain of domains) {
+        for (const path of ['/', window.location.pathname]) {
+          document.cookie =
+            `${name}=;path=${path};${past}` +
+            (domain ? `;domain=${domain}` : '')
+        }
+      }
     }
     try {
       window.sessionStorage.removeItem('ACCESS_TOKEN')
@@ -470,8 +490,10 @@ class BankinContentScript extends ContentScript {
       // login, so we are on the live session page here; later on any
       // navigation would wipe the sessionStorage that holds it.
       this.sendToPilot({ accessToken: token, deviceId: this.findDeviceId() })
-      return true
     }
+    // Being on the login page means not authenticated, whatever token may be
+    // lying around: a cookie we failed to expire would otherwise end the wait
+    // immediately and close the form under the user's eyes.
     const onSignInPage =
       window.location.pathname.startsWith('/signin') ||
       Boolean(document.querySelector('#signin_email'))
