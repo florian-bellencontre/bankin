@@ -8294,29 +8294,39 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     }
 
     const byAccount = {}
-    let holes = 0
+    const holesByAccount = {}
     for (const [vendorAccountId, daySet] of daysByAccount) {
       const days = [...daySet].sort()
       let since = dateMinusDays(days[days.length - 1], ALWAYS_REFETCH_DAYS)
       // A quiet stretch inside one account's own history: the bank did not
       // simply move no money for that long, a run was missed or cut short.
+      // Every hole is collected, not just the first: going back to the oldest
+      // covers them all, but they are the list this run will be checked
+      // against once the operations are in (see reportRemainingHoles).
+      const found = []
       for (let i = 1; i < days.length; i++) {
         const gap = daysBetween(days[i - 1], days[i])
         if (gap > HOLE_GAP_DAYS) {
+          found.push({ from: days[i - 1], to: days[i], gap })
           const holeStart = dateMinusDays(days[i - 1], 1)
           if (holeStart < since) since = holeStart
-          holes++
-          this.log(
-            'warn',
-            `Account ${vendorAccountId}: nothing between ${days[i - 1]} and ` +
-              `${days[i]} (${gap} days), going back there to fill the hole`
-          )
-          break
         }
+      }
+      if (found.length) {
+        holesByAccount[vendorAccountId] = found
+        this.log(
+          'warn',
+          `Account ${vendorAccountId}: ${found.length} hole(s), the oldest ` +
+            `between ${found[0].from} and ${found[0].to} (${found[0].gap} ` +
+            'days), going back there'
+        )
       }
       if (deepest && deepest < since) since = deepest
       byAccount[vendorAccountId] = since
     }
+    const holes = Object.keys(holesByAccount).length
+    // Kept for the check made once the operations are back.
+    this.holesByAccount = holesByAccount
 
     this.log(
       'info',
@@ -8328,6 +8338,50 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     // costs one page for an empty account, and is the only way a genuinely
     // new account gets imported in full.
     return { fallback: null, byAccount }
+  }
+
+  /**
+   * Say, for every hole this run went out to fill, whether Bankin' actually
+   * had anything there. Without it the logs show a refetch that looks
+   * successful while the gap is still empty, and there is no way to tell a
+   * konnector that failed to ask from an account that genuinely had no
+   * activity — which is the only question worth asking once a hole survives.
+   */
+  // P
+  reportRemainingHoles(bankinData) {
+    const holes = this.holesByAccount
+    if (!holes || !bankinData || !Array.isArray(bankinData.allOperations)) {
+      return
+    }
+    const labels = new Map(
+      (bankinData.accounts || []).map(account => [
+        String(account.vendorId),
+        account.label
+      ])
+    )
+    const daysFetched = new Map()
+    for (const operation of bankinData.allOperations) {
+      const key = String(operation.vendorAccountId || '')
+      if (!daysFetched.has(key)) daysFetched.set(key, [])
+      daysFetched.get(key).push(String(operation.date).slice(0, 10))
+    }
+    for (const [vendorAccountId, list] of Object.entries(holes)) {
+      // Accounts saved long ago but no longer returned by the API — closed
+      // ones — were never asked for, so they prove nothing either way.
+      if (!labels.has(vendorAccountId)) continue
+      const days = daysFetched.get(vendorAccountId) || []
+      const name = labels.get(vendorAccountId) || vendorAccountId
+      for (const hole of list) {
+        const filled = days.some(day => day > hole.from && day < hole.to)
+        this.log(
+          filled ? 'info' : 'warn',
+          filled
+            ? `${name}: the gap between ${hole.from} and ${hole.to} is filled`
+            : `${name}: still nothing between ${hole.from} and ${hole.to}, ` +
+                "Bankin' has no operation there"
+        )
+      }
+    }
   }
 
   /**
@@ -8479,6 +8533,7 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
         'The API returned no account at all: nothing will be saved'
       )
     }
+    this.reportRemainingHoles(bankinData)
 
     // Hand the data over to the server part, which owns the bank doctypes:
     // the clisk bridge cannot write io.cozy.bank.* itself. The payload
