@@ -1,9 +1,12 @@
 {
-  "version": "2.1.2",
+  "version": "2.1.3",
   "name": "Bankin'",
   "type": "konnector",
   "language": "node",
   "clientSide": true,
+  "cookie_domains": [
+    "app2.bankin.com"
+  ],
   "icon": "icon.png",
   "slug": "bankin",
   "source": "git@github.com:konnectors/bankin.git",
