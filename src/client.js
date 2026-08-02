@@ -110,6 +110,11 @@ const daysBetween = (from, to) =>
 // see getUserDataFromWebsite.
 const normalizeEmail = email => String(email).trim().toLowerCase()
 
+// How a quiet stretch is identified from one run to the next. Both ends are
+// in the key: if an operation ever lands inside, the boundaries move and the
+// stretch stops being the one that was confirmed empty.
+const gapKey = (from, to) => `${from}>${to}`
+
 // ---------------------------------------------------------------------------
 // Watching the app's own API traffic
 //
@@ -1101,10 +1106,18 @@ class BankinContentScript extends ContentScript {
       )
     }
 
+    // Stretches a previous run already went and asked for, and that Bankin'
+    // answered nothing to. Without this the oldest of them pins `since` to
+    // its date for ever: every run would re-download the whole history to
+    // chase a period that is empty at the source and always will be.
+    const knownEmpty = await this.getConfirmedEmptyGaps()
+
     const byAccount = {}
     const holesByAccount = {}
+    let skipped = 0
     for (const [vendorAccountId, daySet] of daysByAccount) {
       const days = [...daySet].sort()
+      const emptyHere = new Set(knownEmpty[vendorAccountId] || [])
       let since = dateMinusDays(days[days.length - 1], ALWAYS_REFETCH_DAYS)
       // A quiet stretch inside one account's own history: the bank did not
       // simply move no money for that long, a run was missed or cut short.
@@ -1115,6 +1128,10 @@ class BankinContentScript extends ContentScript {
       for (let i = 1; i < days.length; i++) {
         const gap = daysBetween(days[i - 1], days[i])
         if (gap > HOLE_GAP_DAYS) {
+          if (emptyHere.has(gapKey(days[i - 1], days[i]))) {
+            skipped++
+            continue
+          }
           found.push({ from: days[i - 1], to: days[i], gap })
           const holeStart = dateMinusDays(days[i - 1], 1)
           if (holeStart < since) since = holeStart
@@ -1139,7 +1156,8 @@ class BankinContentScript extends ContentScript {
     this.log(
       'info',
       `${allDays.length} days saved (${oldest} to ${newest}) over ` +
-        `${daysByAccount.size} account(s), ${holes} with a hole to fill`
+        `${daysByAccount.size} account(s), ${holes} with a hole to fill` +
+        (skipped ? `, ${skipped} gap(s) known empty and left alone` : '')
     )
     // Accounts with nothing saved — new ones, and the ones that never had a
     // single operation — are not in the map and take the whole history. That
@@ -1156,11 +1174,12 @@ class BankinContentScript extends ContentScript {
    * activity — which is the only question worth asking once a hole survives.
    */
   // P
-  reportRemainingHoles(bankinData) {
+  async reportRemainingHoles(bankinData) {
     const holes = this.holesByAccount
     if (!holes || !bankinData || !Array.isArray(bankinData.allOperations)) {
       return
     }
+    const confirmedEmpty = await this.getConfirmedEmptyGaps()
     const labels = new Map(
       (bankinData.accounts || []).map(account => [
         String(account.vendorId),
@@ -1188,7 +1207,46 @@ class BankinContentScript extends ContentScript {
             : `${name}: still nothing between ${hole.from} and ${hole.to}, ` +
                 "Bankin' has no operation there"
         )
+        if (filled) continue
+        // We asked for this exact stretch and the API gave nothing back: it
+        // is empty at the source. Remember it, or the next run will go and
+        // ask again, for ever. The boundaries are part of the key on
+        // purpose — the day an operation does land in there, the gap splits
+        // into two the konnector has never asked about, and they get chased.
+        const forAccount = confirmedEmpty[vendorAccountId] || []
+        const key = gapKey(hole.from, hole.to)
+        if (!forAccount.includes(key)) forAccount.push(key)
+        confirmedEmpty[vendorAccountId] = forAccount
       }
+    }
+    await this.rememberConfirmedEmptyGaps(confirmedEmpty)
+  }
+
+  /**
+   * The stretches Bankin' has confirmed it has nothing for, kept between runs
+   * next to the history start. Shaped { vendorAccountId: ['from>to', ...] }.
+   */
+  // P
+  async getConfirmedEmptyGaps() {
+    const credentials = await this.getCredentials()
+    return (credentials && credentials.emptyGaps) || {}
+  }
+
+  // P
+  async rememberConfirmedEmptyGaps(gaps) {
+    const total = Object.values(gaps).reduce(
+      (count, list) => count + list.length,
+      0
+    )
+    try {
+      const credentials = (await this.getCredentials()) || {}
+      await this.saveCredentials({ ...credentials, emptyGaps: gaps })
+      this.log(
+        'info',
+        `${total} empty stretch(es) remembered, they will not be asked for again`
+      )
+    } catch (err) {
+      this.log('warn', `Could not remember the empty stretches: ${err.message}`)
     }
   }
 
@@ -1341,7 +1399,7 @@ class BankinContentScript extends ContentScript {
         'The API returned no account at all: nothing will be saved'
       )
     }
-    this.reportRemainingHoles(bankinData)
+    await this.reportRemainingHoles(bankinData)
 
     // Hand the data over to the server part, which owns the bank doctypes:
     // the clisk bridge cannot write io.cozy.bank.* itself. The payload

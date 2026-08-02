@@ -65,39 +65,9 @@ async function start() {
 
   let importFailed = false
   try {
-    // Save one account at a time: BankingReconciliator throws when a
-    // transaction has no matching account, so a single unknown account would
-    // otherwise discard the whole run.
-    const savedAccounts = []
-    for (const account of accounts) {
-      const accountOperations = operationsByAccount[account.vendorId]
-      if (!accountOperations) {
-        log('warn', `No operation for account ${account.vendorId}, skipping`)
-        continue
-      }
-      log(
-        'info',
-        `Saving account ${account.vendorId} with ` +
-          `#${accountOperations.length} operations`
-      )
-      // useSplitDate: false, or nothing older than a week ever gets written.
-      // The reconciliator otherwise takes the most recent transaction already
-      // saved, walks back seven days, and silently discards every fetched
-      // operation older than that (getMissedTransactions, whose `oldestDate`
-      // variable actually holds the *newest* date). Backfilling a hole is
-      // exactly the case it throws away: the client part goes and gets three
-      // missing months, hands them over, and they never reach CouchDB.
-      // Disabling it is safe — reconciliate still recognises what is already
-      // there by vendorId, which Bankin' gives us, so nothing is duplicated.
-      const { accounts: saved } = await reconciliator.save(
-        [account],
-        accountOperations,
-        { useSplitDate: false }
-      )
-      savedAccounts.push(saved[0])
-    }
-    // Operations whose account was not returned by the API would make the
-    // reconciliator throw, so point them out rather than losing them silently.
+    // Operations whose account was not returned by the API are what makes the
+    // reconciliator throw, so leave them out — and say so, rather than losing
+    // them silently.
     const knownIds = accounts.map(account => account.vendorId)
     const orphans = Object.keys(operationsByAccount).filter(
       id => !knownIds.includes(id)
@@ -109,6 +79,48 @@ async function start() {
           ', '
         )}`
       )
+    }
+    for (const account of accounts) {
+      if (!operationsByAccount[account.vendorId]) {
+        log('warn', `No operation for account ${account.vendorId}, skipping`)
+      }
+    }
+
+    // One single call, not one per account. reconciliator.save() reloads the
+    // whole transaction collection (BankTransaction.fetchAll) every time it
+    // runs, so looping made the server reload it once per account — 22 times
+    // per batch here, which is where the thirty seconds went. Passing every
+    // account at once is safe now that the orphans above are left out: an
+    // orphan transaction is the only thing that makes it throw.
+    const accountsToSave = accounts.filter(
+      account => operationsByAccount[account.vendorId]
+    )
+    const operationsToSave = accountsToSave.reduce(
+      (all, account) => all.concat(operationsByAccount[account.vendorId]),
+      []
+    )
+    let savedAccounts = []
+    if (accountsToSave.length) {
+      log(
+        'info',
+        `Saving #${accountsToSave.length} accounts with ` +
+          `#${operationsToSave.length} operations`
+      )
+      // useSplitDate: false, or nothing older than a week ever gets written.
+      // The reconciliator otherwise takes the most recent transaction already
+      // saved, walks back seven days, and silently discards every fetched
+      // operation older than that (getMissedTransactions, whose `oldestDate`
+      // variable actually holds the *newest* date). Backfilling a hole is
+      // exactly the case it throws away: the client part goes and gets three
+      // missing months, hands them over, and they never reach CouchDB.
+      // Disabling it is safe — reconciliate still recognises what is already
+      // there by vendorId, which Bankin' gives us, so nothing is duplicated.
+      const { accounts: saved } = await reconciliator.save(
+        accountsToSave,
+        operationsToSave,
+        { useSplitDate: false }
+      )
+      savedAccounts = saved
     }
     log('info', `Saved #${savedAccounts.length} accounts`)
     const balances = await fetchBalances(savedAccounts)
