@@ -177,21 +177,28 @@ class BankinContentScript extends ContentScript {
     const token = await this.runInWorker('findAccessToken')
     if (!token) return false
     const apiClient = await this.getApiCredentials()
-    const status = await this.runInWorker('checkToken', token, apiClient)
+    let status = await this.runInWorker('checkToken', token, apiClient)
+    // Calls to the API are blocked from the login page; if that is where we
+    // are, move to an app page and ask again before concluding.
+    if (String(status).startsWith('network')) {
+      this.log('info', 'Token check blocked, retrying from an app page')
+      await this.goto(baseUrl)
+      await this.waitForElementInWorker('#signin_email, #root')
+      status = await this.runInWorker('checkToken', token, apiClient)
+    }
     if (status === 'ok') return true
     if (status === 'expired') {
       this.log('info', 'The access token is no longer accepted')
       return false
     }
-    if (status === 'no api client') {
-      // Not a verdict on the token: we simply could not ask. Saying "usable"
-      // here would let an expired session through and fail later, in the
-      // middle of the fetch, so treat it as unusable and let the user log in.
-      this.log('warn', 'No API client to check the token with, asking to login')
-      return false
-    }
-    this.log('warn', `Could not check the token (${status}), trying anyway`)
-    return true
+    // Anything else means the question could not be answered: no API client,
+    // or a request that did not even reach Bankin' — which happens when the
+    // worker sits on the login page, where calls to the API are blocked.
+    // Treating that as "probably fine" is what kept letting dead sessions
+    // through, only to fail later in the middle of the fetch. A login costs
+    // the user one captcha; a false positive costs the whole run.
+    this.log('warn', `Could not check the token (${status}), asking to login`)
+    return false
   }
 
   /**
