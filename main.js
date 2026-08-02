@@ -7945,9 +7945,61 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     return true
   }
 
+  /**
+   * Put the saved identifiers back in the form before showing it. They are
+   * already in the Cozy account, so retyping them every run is pure friction.
+   *
+   * Prefilled, never submitted: the captcha needs a human anyway, and a
+   * programmatic login attempt is exactly what gets an account flagged.
+   */
+  // P
+  async prefillLoginForm() {
+    const credentials = (await this.getCredentials()) || {}
+    const email = credentials.email || (this.store && this.store.email)
+    const password = credentials.password || (this.store && this.store.password)
+    if (!email && !password) {
+      this.log('info', 'Nothing saved to prefill the login form with')
+      return false
+    }
+    // Only ever log which fields were filled, never what went in them.
+    const filled = await this.runInWorker('fillLoginForm', email, password)
+    if (filled && filled.length) {
+      this.log('info', `Login form prefilled (${filled.join(', ')})`)
+      return true
+    }
+    this.log('info', 'The login form was not there to be prefilled')
+    return false
+  }
+
+  // W
+  fillLoginForm(email, password) {
+    // React keeps its own copy of the value and ignores a plain assignment,
+    // leaving the field looking filled while the app still submits an empty
+    // one. Going through the native setter is what makes it notice.
+    const nativeSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLInputElement.prototype,
+      'value'
+    ).set
+    const filled = []
+    for (const [selector, value, name] of [
+      ['#signin_email', email, 'email'],
+      ['#signin_password', password, 'password']
+    ]) {
+      if (!value) continue
+      const field = document.querySelector(selector)
+      if (!field) continue
+      nativeSetter.call(field, value)
+      field.dispatchEvent(new Event('input', { bubbles: true }))
+      field.dispatchEvent(new Event('change', { bubbles: true }))
+      filled.push(name)
+    }
+    return filled
+  }
+
   // P
   async showLoginFormAndWaitForAuthentication() {
     this.log('info', '📍️ showLoginFormAndWaitForAuthentication starts')
+    await this.prefillLoginForm()
     await this.setWorkerState({ visible: true })
     await this.runInWorkerUntilTrue({
       method: 'waitForAuthenticated',
@@ -8765,6 +8817,7 @@ connector
       'fetchBankinData',
       'findAccessToken',
       'readCapturedAuth',
+      'fillLoginForm',
       'readWebAppApiClient',
       'checkToken',
       'readSessionCookies',
