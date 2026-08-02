@@ -227,8 +227,10 @@ class BankinContentScript extends ContentScript {
       status = await this.runInWorker('checkToken', token, apiClient)
     }
     if (status === 'ok') return true
-    if (status === 'expired') {
-      this.log('info', 'The access token is no longer accepted')
+    if (String(status).startsWith('expired')) {
+      // log the reason the API gave, it is the only thing that says whether
+      // the token is stale, tied to another device, or something else
+      this.log('info', `The access token is not accepted — ${status}`)
       return false
     }
     // Anything else means the question could not be answered: no API client,
@@ -275,8 +277,18 @@ class BankinContentScript extends ContentScript {
         }
       })
       if (response.ok) return 'ok'
-      if (response.status === 401 || response.status === 403) return 'expired'
-      return `http ${response.status}`
+      // The body names the actual reason (expired_token, invalid_token,
+      // device_mismatch...). Without it a 401 says nothing about what to fix.
+      let detail = ''
+      try {
+        detail = (await response.text()).slice(0, 200)
+      } catch (err) {
+        detail = '(no body)'
+      }
+      if (response.status === 401 || response.status === 403) {
+        return `expired: ${detail}`
+      }
+      return `http ${response.status}: ${detail}`
     } catch (err) {
       return `network: ${err.message}`
     }
@@ -1155,6 +1167,9 @@ class BankinContentScript extends ContentScript {
         } catch (err) {
           detail = ''
         }
+        // Log before throwing: this exception crosses the bridge as a bare
+        // "false", so the reason would otherwise never reach the logs.
+        this.log('warn', `${path} answered ${response.status}${detail}`)
         const error = new Error(`${path} answered ${response.status}${detail}`)
         error.status = response.status
         throw error
