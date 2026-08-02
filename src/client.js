@@ -42,6 +42,27 @@ const UUID_RE =
 const DEFAULT_CLIENT_ID = process.env.DEFAULT_CLIENT_ID
 const DEFAULT_CLIENT_SECRET = process.env.DEFAULT_CLIENT_SECRET
 
+// Always re-read this many days, whatever is already saved: a bank can
+// confirm an operation days late, and a pending one changes when it settles.
+const ALWAYS_REFETCH_DAYS = 30
+// A quiet stretch longer than this between two saved days is treated as a
+// missed run rather than a bank that moved no money.
+const HOLE_GAP_DAYS = 10
+// When the saved history stops dead (the old 3 month window), extend it by
+// this much per run instead of pulling everything at once.
+const BACKFILL_DAYS = 180
+
+const dateMinusDays = (day, count) => {
+  const date = new Date(`${day}T00:00:00Z`)
+  date.setUTCDate(date.getUTCDate() - count)
+  return date.toISOString().slice(0, 10)
+}
+
+const daysBetween = (from, to) =>
+  Math.round(
+    (new Date(`${to}T00:00:00Z`) - new Date(`${from}T00:00:00Z`)) / 86400000
+  )
+
 // The sourceAccountIdentifier must be byte-for-byte the same on every run,
 // see getUserDataFromWebsite.
 const normalizeEmail = email => String(email).trim().toLowerCase()
@@ -479,6 +500,118 @@ class BankinContentScript extends ContentScript {
     }
   }
 
+  /**
+   * How far back this run has to go.
+   *
+   * The API is paginated newest first, so the cost of a run is the number of
+   * pages walked. Two rules decide where to stop:
+   *
+   *  - always re-read the last ALWAYS_REFETCH_DAYS days. Banks confirm
+   *    operations days after they happened, and a pending one can change its
+   *    date or amount when it settles, so the recent past is never final;
+   *  - if the saved history has holes — days missing inside a stretch we are
+   *    supposed to have — go back to before the oldest hole to fill it.
+   *
+   * With nothing saved yet, take everything: that is the first import.
+   */
+  // P
+  async getFetchSince() {
+    let operations
+    try {
+      operations = await this.queryAll({
+        toDefinition: () => ({ doctype: 'io.cozy.bank.operations' })
+      })
+    } catch (err) {
+      this.log('warn', `Could not read the saved operations: ${err.message}`)
+      return null // no idea, take everything
+    }
+
+    const days = [
+      ...new Set(
+        (operations || [])
+          .filter(operation => operation && operation.date)
+          .map(operation => String(operation.date).slice(0, 10))
+      )
+    ].sort()
+
+    if (!days.length) {
+      this.log('info', 'No operation saved yet, importing the whole history')
+      return null
+    }
+
+    const newest = days[days.length - 1]
+    const oldest = days[0]
+    let since = dateMinusDays(newest, ALWAYS_REFETCH_DAYS)
+
+    // A hole between two saved days: the bank did not simply stay quiet, a
+    // run was missed or was cut short.
+    for (let i = 1; i < days.length; i++) {
+      if (daysBetween(days[i - 1], days[i]) > HOLE_GAP_DAYS) {
+        const holeStart = dateMinusDays(days[i - 1], 1)
+        if (holeStart < since) since = holeStart
+        this.log(
+          'warn',
+          `Gap of more than ${HOLE_GAP_DAYS} days after ${days[i - 1]}, ` +
+            'going further back to fill it'
+        )
+        break
+      }
+    }
+
+    // The truncated past: previous versions only kept a 3 month window, so
+    // the history stops dead at its start instead of at the real beginning of
+    // the account. That edge is a hole too, and the loop above cannot see it
+    // because there is nothing saved before it. Walk back a slice at a time,
+    // run after run, and stop as soon as a run brings nothing older: the
+    // account has then given everything it has.
+    // Compare against how far the previous run *asked*, not what it got: when
+    // we already asked for older operations and the history still starts
+    // here, the account simply has nothing before that date and there is no
+    // point digging every run.
+    const askedBefore = await this.getKnownHistoryStart()
+    if (askedBefore && askedBefore < oldest) {
+      this.log(
+        'info',
+        `History goes back to ${oldest} and ${askedBefore} was already asked ` +
+          'for: nothing older to get'
+      )
+    } else {
+      const deeper = dateMinusDays(oldest, BACKFILL_DAYS)
+      if (deeper < since) since = deeper
+      await this.setKnownHistoryStart(deeper)
+      this.log(
+        'info',
+        `History starts at ${oldest}, reaching back to ${deeper} to extend it`
+      )
+    }
+
+    this.log(
+      'info',
+      `${days.length} days saved (${oldest} to ${newest}), fetching from ${since}`
+    )
+    return since
+  }
+
+  /**
+   * The oldest day we have already imported, remembered between runs so the
+   * backfill knows whether it made progress last time.
+   */
+  // P
+  async getKnownHistoryStart() {
+    const credentials = await this.getCredentials()
+    return (credentials && credentials.historyStart) || null
+  }
+
+  // P
+  async setKnownHistoryStart(day) {
+    try {
+      const credentials = (await this.getCredentials()) || {}
+      await this.saveCredentials({ ...credentials, historyStart: day })
+    } catch (err) {
+      this.log('warn', `Could not remember the history start: ${err.message}`)
+    }
+  }
+
   // P
   async fetch(context) {
     this.log('info', '📍️ fetch starts')
@@ -549,6 +682,7 @@ class BankinContentScript extends ContentScript {
     // retry once rather than reporting a fetch failure.
     const deviceId = (this.store && this.store.deviceId) || ''
     const apiClient = await this.getApiCredentials()
+    const since = await this.getFetchSince()
     this.log(
       'info',
       `API client: ${
@@ -559,7 +693,8 @@ class BankinContentScript extends ContentScript {
       'fetchBankinData',
       token,
       deviceId,
-      apiClient
+      apiClient,
+      since
     )
     if (bankinData === false) {
       this.log('warn', 'The worker returned false, retrying once')
@@ -567,7 +702,8 @@ class BankinContentScript extends ContentScript {
         'fetchBankinData',
         token,
         deviceId,
-        apiClient
+        apiClient,
+        since
       )
     }
     // the worker reports its failures as data, an exception would cross the
@@ -670,7 +806,7 @@ class BankinContentScript extends ContentScript {
   }
 
   // W
-  async fetchBankinData(givenToken, givenDeviceId, givenApiClient) {
+  async fetchBankinData(givenToken, givenDeviceId, givenApiClient, since) {
     // First thing, before anything can throw: prove the method really ran.
     // A silent failure here used to surface as an unexplained "false".
     this.log('info', '📍️ fetchBankinData starts (in the worker)')
@@ -751,19 +887,32 @@ class BankinContentScript extends ContentScript {
     for (const account of accounts) {
       let path = `/v2/accounts/${account.vendorId}/transactions?limit=200`
       let pages = 0
+      let stoppedEarly = false
       const before = allOperations.length
-      // The API paginates; follow next_uri until it is gone.
+      // The API paginates, newest first; follow next_uri until it is gone or
+      // until we reach operations we already have.
       while (path) {
         const page = await call(path)
-        allOperations = allOperations.concat(formatOperations(page.resources))
-        path = page.pagination && page.pagination.next_uri
+        const operations = formatOperations(page.resources)
+        allOperations = allOperations.concat(operations)
         pages++
+
+        if (since && operations.length) {
+          // resources are ordered newest first: once the last one of the page
+          // is older than what we need, the following pages are older still
+          const oldest = operations[operations.length - 1].date.slice(0, 10)
+          if (oldest < since) {
+            stoppedEarly = true
+            break
+          }
+        }
+        path = page.pagination && page.pagination.next_uri
       }
       this.log(
         'info',
-        `Account ${account.vendorId}: ${
-          allOperations.length - before
-        } operations in ${pages} page(s)`
+        `Account ${account.vendorId}: ${allOperations.length - before} ` +
+          `operations in ${pages} page(s)` +
+          (stoppedEarly ? ' (stopped, reached the known ones)' : '')
       )
     }
 

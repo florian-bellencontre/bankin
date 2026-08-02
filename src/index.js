@@ -136,13 +136,16 @@ async function start() {
 }
 
 /**
- * Bankin' returns the full history and operations that have not happened yet;
- * we only want settled operations from the last few months.
+ * Bankin' also returns operations that have not happened yet; keep everything
+ * else.
+ *
+ * There used to be a three month window here, but the client-side part now
+ * decides how far back to go (it knows what is already saved, and stops
+ * paginating accordingly). Cutting again on this side would throw away the
+ * very operations it went to fetch, and leave holes that never get filled.
  */
 const filterOperations = operations => {
-  // moment mutates, so derive each bound from its own instance
   const tomorrow = moment().add(1, 'days').format('YYYY-MM-DD')
-  const threshold = moment().subtract(3, 'months').format('YYYY-MM-DD')
 
   return (
     operations
@@ -151,8 +154,7 @@ const filterOperations = operations => {
           !operation.is_future &&
           // dates are 'YYYY-MM-DDT12:00:00.000Z', which still compares
           // correctly against a 'YYYY-MM-DD' bound
-          operation.date < tomorrow &&
-          operation.date >= threshold
+          operation.date < tomorrow
       )
       // is_future is only there to be filtered on, it has no place in the
       // saved io.cozy.bank.operations documents
