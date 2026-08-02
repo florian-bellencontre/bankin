@@ -7302,6 +7302,135 @@ const daysBetween = (from, to) =>
 // see getUserDataFromWebsite.
 const normalizeEmail = email => String(email).trim().toLowerCase()
 
+// ---------------------------------------------------------------------------
+// Watching the app's own API traffic
+//
+// Every version of this konnector so far tried to work out *where* the app
+// keeps its session — a cookie, sessionStorage, the native jar — and every one
+// of them ended up reading a token the API answered "expired" to, seconds
+// after a successful login. Guessing the storage is the wrong problem.
+//
+// Whatever it stores and wherever it stores it, the app puts the token it
+// considers current in the Authorization header of every call it makes, and
+// receives a brand new one in the body of /v2/authenticate. Watching those two
+// things gives the live session with no guesswork at all, and answers the
+// question the logs never could: does the app re-authenticate when the user
+// signs in, or does it reuse something stale?
+// ---------------------------------------------------------------------------
+
+// Requests made by the konnector carry this header so the watcher can tell
+// them from the app's, and never hands back a token it supplied itself.
+const OWN_REQUEST_MARK = 'X-Cozy-Konnector'
+
+const captured = {
+  accessToken: null,
+  deviceId: null,
+  // where the token came from, for the logs
+  from: null,
+  // did the app really call /v2/authenticate during this run?
+  authenticateSeen: false
+}
+
+const resetCapturedAuth = () => {
+  captured.accessToken = null
+  captured.deviceId = null
+  captured.from = null
+  captured.authenticateSeen = false
+}
+
+const headerLookup = headers => name => {
+  if (!headers) return null
+  if (typeof headers.get === 'function') return headers.get(name)
+  const key = Object.keys(headers).find(
+    candidate => candidate.toLowerCase() === name.toLowerCase()
+  )
+  return key ? headers[key] : null
+}
+
+/**
+ * Record the session carried by a request the app just made.
+ * Only requests to the API count, and only the app's own: ours are marked.
+ */
+const rememberRequest = (url, headers, from) => {
+  if (!url || !String(url).includes('sync.bankin.com')) return
+  const header = headerLookup(headers)
+  if (header(OWN_REQUEST_MARK)) return
+  const authorization = header('Authorization') || ''
+  const token = authorization.replace(/^Bearer\s+/i, '').trim()
+  const device = header('Bankin-Device')
+  if (device) captured.deviceId = device
+  if (!token) return
+  if (token !== captured.accessToken) {
+    captured.accessToken = token
+    captured.from = from
+  }
+}
+
+/**
+ * Patch fetch and XHR to read the Authorization header off the app's calls.
+ * Nothing is read from the responses here and no value is ever logged.
+ */
+const watchApiTraffic = () => {
+  const savedFetch = window.fetch
+  window.fetch = function (input, options) {
+    try {
+      const url =
+        typeof input === 'string'
+          ? input
+          : (input && input.url) || String(input)
+      const headers =
+        (options && options.headers) || (input && input.headers) || null
+      rememberRequest(url, headers, 'a fetch call')
+    } catch (err) {
+      log.warn(`Could not watch a fetch call: ${err.message}`)
+    }
+    return savedFetch.apply(window, arguments)
+  }
+
+  const savedOpen = window.XMLHttpRequest.prototype.open
+  const savedSetRequestHeader = window.XMLHttpRequest.prototype.setRequestHeader
+  window.XMLHttpRequest.prototype.open = function (method, url) {
+    this._bankinUrl = url
+    this._bankinHeaders = {}
+    return savedOpen.apply(this, arguments)
+  }
+  window.XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+    try {
+      if (this._bankinHeaders) {
+        this._bankinHeaders[name] = value
+        rememberRequest(this._bankinUrl, this._bankinHeaders, 'an xhr call')
+      }
+    } catch (err) {
+      log.warn(`Could not watch an xhr header: ${err.message}`)
+    }
+    return savedSetRequestHeader.apply(this, arguments)
+  }
+}
+
+// The response of a login is the only place a token appears before the app has
+// stored it anywhere, so it is also the only proof that a login really
+// happened. Kept apart from the header watcher: this one answers "did the app
+// authenticate", the other "what is it using right now".
+const requestInterceptor = new cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_MODULE_0__.RequestInterceptor([
+  {
+    identifier: 'authenticate',
+    method: 'POST',
+    url: '/v2/authenticate',
+    serialization: 'json'
+  }
+])
+requestInterceptor.on('response', ({ identifier, response }) => {
+  if (identifier !== 'authenticate') return
+  captured.authenticateSeen = true
+  const token = response && response.access_token
+  if (token) {
+    captured.accessToken = token
+    captured.from = 'the login response'
+  }
+})
+requestInterceptor.init()
+watchApiTraffic()
+
 class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTED_MODULE_0__.ContentScript {
   // P
   async ensureAuthenticated({ account } = {}) {
@@ -7484,6 +7613,7 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     try {
       const response = await window.fetch(`${apiUrl}/v2/users/me`, {
         headers: {
+          [OWN_REQUEST_MARK]: '1',
           'Bankin-Version': bankinVersion,
           'Bankin-Device': this.findDeviceId(),
           'Client-Id': clientId,
@@ -7580,6 +7710,10 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
 
   // W
   async wipeSessionCookies() {
+    // Dropping a session means forgetting the token seen on the wire too,
+    // otherwise findAccessToken would keep handing back the dead one it
+    // captured before the wipe.
+    resetCapturedAuth()
     // Every cookie the app owns, not just the ones we know by name: a
     // leftover would be mistaken for a token by findAccessToken. The device
     // id is kept: it identifies this webview to Bankin', a token is issued
@@ -7821,6 +7955,26 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       timeout: 5 * 60 * 1000
     })
     await this.setWorkerState({ visible: false })
+
+    // The one thing the logs never said. If the app did not authenticate,
+    // then whatever token is readable afterwards is not a new one, and no
+    // amount of looking for it in a better place will help.
+    const seen = (await this.runInWorker('readCapturedAuth')) || {}
+    if (seen.authenticateSeen) {
+      this.log('info', 'The app called /v2/authenticate: this login is real')
+    } else {
+      this.log(
+        'warn',
+        'The app never called /v2/authenticate during this login: it reused a ' +
+          'session it already had'
+      )
+    }
+    this.log(
+      'info',
+      seen.hasToken
+        ? `Token captured from ${seen.from} (${seen.tokenLength} chars)`
+        : 'No token seen on the app traffic, falling back to the stored ones'
+    )
   }
 
   /**
@@ -7986,6 +8140,7 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     try {
       const response = await window.fetch(`${apiUrl}/v2/users/me`, {
         headers: {
+          [OWN_REQUEST_MARK]: '1',
           'Bankin-Version': bankinVersion,
           'Bankin-Device': this.findDeviceId(),
           'Client-Id': clientId,
@@ -8389,6 +8544,7 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     const call = async path => {
       const response = await window.fetch(`${apiUrl}${path}`, {
         headers: {
+          [OWN_REQUEST_MARK]: '1',
           'Bankin-Version': bankinVersion,
           'Bankin-Device': deviceId,
           'Client-Id': clientId,
@@ -8529,6 +8685,9 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
    */
   // W
   findDeviceId() {
+    // A token is issued for one device; take the one the app pairs with the
+    // token we captured rather than risk mixing the two.
+    if (captured.deviceId) return captured.deviceId
     const known =
       this.getCookie(DEVICE_ID_COOKIE) || this.readStorage('DEVICE_ID')
     if (known) return known
@@ -8539,11 +8698,29 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
   }
 
   /**
+   * What was seen on the app's own API traffic. Never returns the token
+   * itself, only what can be said about it without writing it down.
+   */
+  // W
+  readCapturedAuth() {
+    return {
+      hasToken: Boolean(captured.accessToken),
+      tokenLength: captured.accessToken ? captured.accessToken.length : 0,
+      from: captured.from,
+      authenticateSeen: captured.authenticateSeen
+    }
+  }
+
+  /**
    * The access token is the only long opaque value left once the known short
    * ones (lang, analytics, device) are ruled out.
    */
   // W
   findAccessToken() {
+    // What the app is actually using beats anything found lying around: a
+    // stored value can be a leftover of a previous session, the header of a
+    // live request cannot.
+    if (captured.accessToken) return captured.accessToken
     const known =
       this.getCookie(ACCESS_TOKEN_COOKIE) || this.readStorage('ACCESS_TOKEN')
     if (known) return known
@@ -8577,7 +8754,9 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
   }
 }
 
-const connector = new BankinContentScript()
+// The interceptor must be handed over, not just created: that is what gives it
+// a logger, without which it throws while reporting an interception.
+const connector = new BankinContentScript({ requestInterceptor })
 connector
   .init({
     additionalExposedMethodsNames: [
@@ -8585,6 +8764,7 @@ connector
       'getUserEmail',
       'fetchBankinData',
       'findAccessToken',
+      'readCapturedAuth',
       'readWebAppApiClient',
       'checkToken',
       'readSessionCookies',
