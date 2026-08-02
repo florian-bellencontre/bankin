@@ -8,8 +8,6 @@ const {
 const doctypes = require('cozy-doctypes/dist')
 const moment = require('moment')
 
-const BankinApi = require('./bankin-api')
-
 const {
   Document,
   BankAccount,
@@ -23,48 +21,39 @@ Document.registerClient(cozyClient)
 
 const reconciliator = new BankingReconciliator({ BankAccount, BankTransaction })
 
-const defaultClientId = process.env.DEFAULT_CLIENT_ID
-const defaultClientSecret = process.env.DEFAULT_CLIENT_SECRET
-
 module.exports = new BaseKonnector(start)
 
-async function start(fields) {
-  let accountData = this.getAccountData() || {}
+async function start() {
+  const accountData = this.getAccountData() || {}
 
-  // Two ways in:
-  // - the client-side part ran in the phone webview, called the Bankin' API
-  //   from there and left the result in the account data before starting us
-  //   with runServerJob: every call to Bankin' then comes from the user's own
-  //   IP, which is the whole point of doing it in the webview
-  // - nothing was handed over, so we call the API ourselves (kept for
-  //   standalone runs; it hits the captcha wall on a real account)
+  // This half NEVER talks to Bankin'. Their login is behind a captcha, so the
+  // only thing a server request would achieve is a failed authentication,
+  // which makes the Cozy ask the user to log in again. All the fetching is
+  // done by the client-side part, from the user's phone, and left here.
   //
-  // NB: extra runServerJob arguments cannot be used to carry this, as
-  // BaseKonnector rebuilds `fields` from account.auth/oauth only and drops
-  // anything else present in the job message.
-  let accounts, allOperations
+  // NB: the data cannot travel as runServerJob arguments, BaseKonnector
+  // rebuilds `fields` from account.auth/oauth only and drops the rest.
   const harvested = accountData.bankinData
 
-  if (harvested) {
-    log('info', 'Using the data fetched by the client-side part')
-    ;({ accounts, allOperations } = harvested)
-    if (!Array.isArray(accounts) || !Array.isArray(allOperations)) {
-      throw new Error(
-        'The data left by the client-side part is malformed ' +
-          `(accounts: ${typeof accounts}, operations: ${typeof allOperations})`
-      )
-    }
-    log(
-      'info',
-      `Received #${accounts.length} accounts and #${allOperations.length} operations`
-    )
-  } else {
-    log('info', 'No client-side data, calling the API from here')
-    const surchargedFiels = surchargeFields(fields)
-    const bankinApi = new BankinApi(surchargedFiels, accountData)
-    ;({ accounts, allOperations } = await bankinApi.fetchAllOperations())
-    accountData.bankinDeviceId = bankinApi.bankinDeviceId
+  if (!harvested) {
+    // Expected: when the account is created the launcher fires a server job
+    // of its own, before the client-side part had a chance to collect
+    // anything. There is simply nothing to do yet.
+    log('info', 'No data collected by the client-side part yet, nothing to do')
+    return
   }
+
+  const { accounts, allOperations } = harvested
+  if (!Array.isArray(accounts) || !Array.isArray(allOperations)) {
+    throw new Error(
+      'The data left by the client-side part is malformed ' +
+        `(accounts: ${typeof accounts}, operations: ${typeof allOperations})`
+    )
+  }
+  log(
+    'info',
+    `Received #${accounts.length} accounts and #${allOperations.length} operations`
+  )
 
   const operations = filterOperations(allOperations)
   log(
@@ -180,21 +169,6 @@ const groupByAccount = transactions =>
     groups[accountId].push(transaction)
     return groups
   }, {})
-
-const surchargeFields = fields => {
-  if (!(typeof fields.clientId === 'string') || fields.clientId.length === 0) {
-    fields.clientId = defaultClientId
-  }
-
-  if (
-    !(typeof fields.clientSecret === 'string') ||
-    fields.clientSecret.length === 0
-  ) {
-    fields.clientSecret = defaultClientSecret
-  }
-
-  return fields
-}
 
 const fetchBalances = accounts => {
   const now = moment()
