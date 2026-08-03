@@ -7255,6 +7255,10 @@ const HOLE_GAP_DAYS = 10
 // When the saved history stops dead (the old 3 month window), extend it by
 // this much per run instead of pulling everything at once.
 const BACKFILL_DAYS = 180
+// Bumped whenever the rule deciding that a stretch is empty at the source
+// changes, so the stretches remembered under the old rule are dropped instead
+// of silently keeping the konnector away from them. See getConfirmedEmptyGaps.
+const EMPTY_GAPS_VERSION = 2
 
 // CouchDB refuses documents above 8 MB and the payload rides in the account
 // document; ~370 bytes per operation leaves plenty of room at this size.
@@ -8390,19 +8394,36 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       if (!labels.has(vendorAccountId)) continue
       const days = daysFetched.get(vendorAccountId) || []
       const name = labels.get(vendorAccountId) || vendorAccountId
+      const reached = (bankinData.reachedBack || {})[vendorAccountId] || {}
       for (const hole of list) {
         const filled = days.some(day => day > hole.from && day < hole.to)
+        // Getting nothing back is not evidence of an empty period. The
+        // pagination walks from today backwards and stops either where we told
+        // it to or when the API runs out of pages, and Bankin' only serves a
+        // limited history per account. When it ran out before reaching the gap
+        // we never asked the question, so there is nothing to conclude and
+        // above all nothing to remember: caching that as "empty at the source"
+        // is how a stretch the bank does have gets skipped for ever.
+        const covered =
+          reached.stoppedEarly ||
+          (reached.oldest && reached.oldest <= hole.from)
         this.log(
-          filled ? 'info' : 'warn',
+          filled || !covered ? 'info' : 'warn',
           filled
             ? `${name}: the gap between ${hole.from} and ${hole.to} is filled`
+            : !covered
+            ? `${name}: the gap between ${hole.from} and ${hole.to} was not ` +
+              `reached, the API stopped at ${
+                reached.oldest || 'no operation'
+              }` +
+              ' — asking again next run'
             : `${name}: still nothing between ${hole.from} and ${hole.to}, ` +
-                "Bankin' has no operation there"
+              "Bankin' has no operation there"
         )
-        if (filled) continue
-        // We asked for this exact stretch and the API gave nothing back: it
-        // is empty at the source. Remember it, or the next run will go and
-        // ask again, for ever. The boundaries are part of the key on
+        if (filled || !covered) continue
+        // The API served operations from before this stretch and none inside
+        // it: it is empty at the source. Remember it, or the next run will go
+        // and ask again, for ever. The boundaries are part of the key on
         // purpose — the day an operation does land in there, the gap splits
         // into two the konnector has never asked about, and they get chased.
         const forAccount = confirmedEmpty[vendorAccountId] || []
@@ -8417,11 +8438,31 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
   /**
    * The stretches Bankin' has confirmed it has nothing for, kept between runs
    * next to the history start. Shaped { vendorAccountId: ['from>to', ...] }.
+   *
+   * Entries written before EMPTY_GAPS_VERSION 2 are thrown away rather than
+   * trusted: until then a stretch was recorded as empty whenever the fetch came
+   * back without operations in it, including when the pagination had run out of
+   * pages long before reaching it. Those entries make the konnector skip
+   * periods the bank does have, and no later run can undo that on its own —
+   * being cached is precisely what stops them from ever being asked for again.
    */
   // P
   async getConfirmedEmptyGaps() {
     const credentials = await this.getCredentials()
-    return (credentials && credentials.emptyGaps) || {}
+    if (!credentials || !credentials.emptyGaps) return {}
+    if ((credentials.emptyGapsVersion || 1) < EMPTY_GAPS_VERSION) {
+      const stale = Object.values(credentials.emptyGaps).reduce(
+        (count, list) => count + list.length,
+        0
+      )
+      this.log(
+        'warn',
+        `Dropping ${stale} empty stretch(es) recorded by an older version: ` +
+          'they may not have been asked for at all. They will be chased again.'
+      )
+      return {}
+    }
+    return credentials.emptyGaps
   }
 
   // P
@@ -8432,7 +8473,11 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     )
     try {
       const credentials = (await this.getCredentials()) || {}
-      await this.saveCredentials({ ...credentials, emptyGaps: gaps })
+      await this.saveCredentials({
+        ...credentials,
+        emptyGaps: gaps,
+        emptyGapsVersion: EMPTY_GAPS_VERSION
+      })
       this.log(
         'info',
         `${total} empty stretch(es) remembered, they will not be asked for again`
@@ -8776,6 +8821,13 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     const { fallback = null, byAccount = {} } = sinceSpec || {}
 
     let allOperations = []
+    // How far back the API actually went, per account. Without it there is no
+    // way to tell "we asked for 2023 and the bank has nothing there" from "the
+    // pagination ran out of pages before ever reaching 2023" — and treating the
+    // second as the first is what marks a whole quarter empty for ever. Read by
+    // reportRemainingHoles; it has to travel in the returned object because
+    // this half runs in the worker webview, so `this` does not cross over.
+    const reachedBack = {}
     for (const account of accounts) {
       // Each account has its own starting point: one of them missing a
       // quarter must dig that far back without dragging the other 21 with it.
@@ -8808,16 +8860,29 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
         }
         path = page.pagination && page.pagination.next_uri
       }
+      const received = allOperations.slice(before).map(o => o.date.slice(0, 10))
+      const oldestReceived = received.length ? received.sort()[0] : null
+      reachedBack[String(account.vendorId)] = {
+        oldest: oldestReceived,
+        // We broke out of the loop ourselves, so the API still had older pages:
+        // whatever we did not read, it holds. When it is false the pagination
+        // ended on its own and `oldest` is the whole history the API will serve.
+        stoppedEarly
+      }
       this.log(
         'info',
         `Account ${account.vendorId}: ${allOperations.length - before} ` +
           `operations in ${pages} page(s)` +
           (since ? ` since ${since}` : ' (whole history)') +
-          (stoppedEarly ? ', stopped there' : '')
+          (stoppedEarly
+            ? ', stopped there'
+            : `, the API had nothing older than ${
+                oldestReceived || 'anything'
+              }`)
       )
     }
 
-    return { accounts, allOperations }
+    return { accounts, allOperations, reachedBack }
   }
 
   // W
