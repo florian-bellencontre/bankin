@@ -8345,6 +8345,36 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       if (deepest && deepest < since) since = deepest
       byAccount[vendorAccountId] = since
     }
+    // TEMPORARY, remove once the run below has happened.
+    //
+    // Hole detection cannot see what is missing from this account. It works on
+    // the calendar of saved days, and a missing incoming transfer on a day that
+    // already carries card activity leaves no gap at all — no stretch of ten
+    // quiet days, nothing to notice. Yet the recorded flows and the balances the
+    // bank reported disagree by 44 228 euros since 2023, so operations are
+    // missing from inside periods that look perfectly covered.
+    //
+    // The API serves the whole history (it went back to 2016 in one page for the
+    // other accounts), so asking for all of it and comparing is what settles
+    // whether Bankin' has those operations and we never asked, or whether they
+    // are not there either. Safe to do since 2.9.0: dedupePayload and
+    // dropAlreadySaved exist precisely to make a full refetch idempotent.
+    // Every account rather than a list of ids: an account number has no place
+    // in a source file, and the other accounts return their whole history in a
+    // single page anyway, so asking for all of them costs almost nothing more.
+    const FULL_REFETCH = true
+    if (FULL_REFETCH) {
+      for (const vendorAccountId of Object.keys(byAccount)) {
+        byAccount[vendorAccountId] = null
+      }
+      this.log(
+        'warn',
+        `Asking for the whole history of all ${
+          Object.keys(byAccount).length
+        } accounts on purpose, to find out what is missing from them`
+      )
+    }
+
     const holes = Object.keys(holesByAccount).length
     // Kept for the check made once the operations are back.
     this.holesByAccount = holesByAccount
