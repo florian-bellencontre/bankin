@@ -8345,43 +8345,9 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       if (deepest && deepest < since) since = deepest
       byAccount[vendorAccountId] = since
     }
-    // TEMPORARY, remove once the run below has happened.
-    //
-    // Hole detection works on the calendar of saved days, so it can only find
-    // what is missing from a stretch where nothing at all was saved. An
-    // operation missing on a day that already carries other activity leaves no
-    // gap: no run of quiet days, nothing to notice. Comparing the recorded
-    // flows against the balances the bank reported shows exactly that happening
-    // — they disagree over periods whose calendar looks perfectly covered.
-    //
-    // The API serves the whole history in a handful of pages per account, so
-    // asking for all of it and comparing is what settles whether the operations
-    // exist upstream and were never asked for, or are not there either. Safe to
-    // do since 2.9.0: dedupePayload and dropAlreadySaved exist precisely to
-    // make a full refetch idempotent.
-    // Every account rather than a list of ids: an account number has no place
-    // in a source file, and the other accounts return their whole history in a
-    // single page anyway, so asking for all of them costs almost nothing more.
-    const FULL_REFETCH = true
-    if (FULL_REFETCH) {
-      for (const vendorAccountId of Object.keys(byAccount)) {
-        byAccount[vendorAccountId] = null
-      }
-      this.log(
-        'warn',
-        `Asking for the whole history of all ${
-          Object.keys(byAccount).length
-        } accounts on purpose, to find out what is missing from them`
-      )
-    }
-
     const holes = Object.keys(holesByAccount).length
-    // Kept for the checks made once the operations are back.
+    // Kept for the check made once the operations are back.
     this.holesByAccount = holesByAccount
-    this.savedOperations = saved
-    this.askedWholeHistory = new Set(
-      Object.keys(byAccount).filter(id => byAccount[id] === null)
-    )
 
     this.log(
       'info',
@@ -8467,184 +8433,6 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       }
     }
     await this.rememberConfirmedEmptyGaps(confirmedEmpty)
-  }
-
-  /**
-   * Count the saved operations that Bankin' does not have any more, and what
-   * they are worth.
-   *
-   * Hole detection answers "is a period missing"; this answers the opposite and
-   * so far unasked question, "is the Cozy holding operations the source does
-   * not". Both directions matter, because the recorded flows and the balances
-   * the bank reported disagree, and an operation too many moves the total by
-   * exactly as much as one missing.
-   *
-   * Only accounts whose whole history was asked for are looked at: comparing
-   * against a thirty-day fetch would call everything older an orphan. And the
-   * comparison is done here rather than server-side because the payload is cut
-   * into batches of MAX_OPERATIONS_PER_BATCH before it goes over, so each half
-   * would call the other half's operations missing.
-   *
-   * Aggregates only, on purpose: counts, sums and years say everything needed
-   * to decide, and no operation label has to leave the device to say it.
-   */
-  // P
-  reportOperationsNotAtSource(bankinData) {
-    const saved = this.savedOperations
-    const whole = this.askedWholeHistory
-    if (!saved || !whole || !whole.size || !bankinData) return
-    const fetched = bankinData.allOperations
-    if (!Array.isArray(fetched)) return
-
-    const atSource = new Map()
-    for (const operation of fetched) {
-      const key = String(operation.vendorAccountId || '')
-      if (!atSource.has(key)) atSource.set(key, new Set())
-      atSource.get(key).add(String(operation.vendorId))
-    }
-
-    for (const vendorAccountId of whole) {
-      const ids = atSource.get(vendorAccountId)
-      if (!ids) continue
-      const mine = saved.filter(
-        operation => String(operation.vendorAccountId) === vendorAccountId
-      )
-      const orphans = mine.filter(
-        operation => !ids.has(String(operation.vendorId))
-      )
-      if (!orphans.length) {
-        this.log(
-          'info',
-          `Account ${vendorAccountId}: all ${mine.length} saved operations are ` +
-            `still at the source (${ids.size} there)`
-        )
-        continue
-      }
-      const net = orphans.reduce(
-        (sum, operation) => sum + (Number(operation.amount) || 0),
-        0
-      )
-      // Anything carrying a bill link or a hand-picked category is manual work
-      // that deleting the operation would destroy, so it is counted before any
-      // decision is taken, not after.
-      const precious = orphans.filter(
-        operation =>
-          operation.manualCategoryId ||
-          (operation.bills && operation.bills.length) ||
-          (operation.reimbursements && operation.reimbursements.length)
-      ).length
-      const perYear = {}
-      for (const operation of orphans) {
-        const key = String(operation.date || '').slice(0, 4)
-        if (!perYear[key]) perYear[key] = { n: 0, net: 0 }
-        perYear[key].n++
-        perYear[key].net += Number(operation.amount) || 0
-      }
-      this.log(
-        'warn',
-        `Account ${vendorAccountId}: ${orphans.length} saved operations are ` +
-          `not at the source any more (${mine.length} saved, ${ids.size} at ` +
-          `Bankin'), worth ${net.toFixed(2)} net, average ` +
-          `${(net / orphans.length).toFixed(
-            2
-          )}, ${precious} of them carrying ` +
-          'a bill link or a hand-picked category'
-      )
-      for (const key of Object.keys(perYear).sort()) {
-        this.log(
-          'info',
-          `  ${vendorAccountId} ${key}: ${perYear[key].n} not at the source, ` +
-            `${perYear[key].net.toFixed(2)} net`
-        )
-      }
-      this.reportOrphanOrigin(vendorAccountId, orphans, mine, ids)
-    }
-  }
-
-  /**
-   * Say where the operations the source no longer has actually came from. Being
-   * surplus is not a reason to delete them: a surplus operation with a twin
-   * still in the base is a duplicate, and deleting it is housekeeping, whereas
-   * one with no twin is the only remaining record of something that happened,
-   * and deleting it loses information the source cannot give back.
-   *
-   * Two independent signals, because neither is conclusive alone:
-   *
-   * - a twin, looked for on the amount within a few days rather than on the
-   *   exact day and label. An operation re-issued when it goes from pending to
-   *   final keeps its amount and moves its date, so an exact-content test misses
-   *   precisely the duplicates worth finding.
-   * - dateImport, which is a genuine provenance record: applyUpdateIfDifferent
-   *   drops it from every update, so it keeps the date of the *first* import and
-   *   is never rewritten. Grouping by it says which runs created these, which
-   *   can then be matched against what the konnector was doing at the time.
-   */
-  // P
-  reportOrphanOrigin(vendorAccountId, orphans, mine, idsAtSource) {
-    const others = mine.filter(
-      operation => idsAtSource.has(String(operation.vendorId))
-      // Twins are looked for among the operations the source still has, so that
-      // two orphans cannot vouch for each other.
-    )
-    const byAmount = new Map()
-    for (const operation of others) {
-      const key = (Number(operation.amount) || 0).toFixed(2)
-      if (!byAmount.has(key)) byAmount.set(key, [])
-      byAmount.get(key).push(String(operation.date || '').slice(0, 10))
-    }
-    // One twin can only account for one orphan, or a recurring subscription
-    // would vouch for every copy of itself.
-    const used = new Set()
-    let withTwin = 0
-    let twinNet = 0
-    for (const orphan of orphans) {
-      const key = (Number(orphan.amount) || 0).toFixed(2)
-      const when = String(orphan.date || '').slice(0, 10)
-      const candidates = byAmount.get(key) || []
-      const found = candidates.findIndex(
-        (day, i) =>
-          !used.has(`${key}|${i}`) && Math.abs(daysBetween(day, when)) <= 5
-      )
-      if (found !== -1) {
-        used.add(`${key}|${found}`)
-        withTwin++
-        twinNet += Number(orphan.amount) || 0
-      }
-    }
-    this.log(
-      'warn',
-      `Account ${vendorAccountId}: ${withTwin} of the ${orphans.length} have a ` +
-        `twin still at the source (same amount within 5 days), worth ` +
-        `${twinNet.toFixed(2)}; the other ${
-          orphans.length - withTwin
-        } have none, worth ${(
-          orphans.reduce((sum, o) => sum + (Number(o.amount) || 0), 0) - twinNet
-        ).toFixed(2)}`
-    )
-
-    const byImport = {}
-    for (const orphan of orphans) {
-      const key = orphan.dateImport
-        ? String(orphan.dateImport).slice(0, 10)
-        : 'no dateImport'
-      if (!byImport[key]) byImport[key] = { n: 0, net: 0 }
-      byImport[key].n++
-      byImport[key].net += Number(orphan.amount) || 0
-    }
-    const days = Object.entries(byImport).sort((a, b) => b[1].n - a[1].n)
-    this.log(
-      'warn',
-      `Account ${vendorAccountId}: they entered the Cozy over ${days.length} ` +
-        'distinct import day(s); the 15 biggest:'
-    )
-    for (const [when, row] of days.slice(0, 15)) {
-      this.log(
-        'info',
-        `  ${vendorAccountId} imported ${when}: ${row.n}, ${row.net.toFixed(
-          2
-        )} net`
-      )
-    }
   }
 
   /**
@@ -8849,7 +8637,6 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       )
     }
     await this.reportRemainingHoles(bankinData)
-    this.reportOperationsNotAtSource(bankinData)
 
     // Hand the data over to the server part, which owns the bank doctypes:
     // the clisk bridge cannot write io.cozy.bank.* itself. The payload
