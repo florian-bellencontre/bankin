@@ -6,6 +6,12 @@ const {
   categorize
 } = require('cozy-konnector-libs')
 const doctypes = require('cozy-doctypes/dist')
+// Not re-exported by cozy-doctypes' index, hence the deep path. This is the
+// fuzzy matcher the reconciliator uses internally to recognise a transaction
+// whose vendor id has changed; see dropAlreadySaved below.
+const {
+  matchTransactions
+} = require('cozy-doctypes/dist/banking/matching-transactions')
 const moment = require('moment')
 
 const {
@@ -55,7 +61,7 @@ async function start() {
     `Received #${accounts.length} accounts and #${allOperations.length} operations`
   )
 
-  const operations = filterOperations(allOperations)
+  const operations = dedupePayload(filterOperations(allOperations))
   log(
     'info',
     `Keeping #${operations.length} operations out of #${allOperations.length}`
@@ -95,9 +101,9 @@ async function start() {
     const accountsToSave = accounts.filter(
       account => operationsByAccount[account.vendorId]
     )
-    const operationsToSave = accountsToSave.reduce(
-      (all, account) => all.concat(operationsByAccount[account.vendorId]),
-      []
+    const operationsToSave = await dropAlreadySaved(
+      accountsToSave,
+      operationsByAccount
     )
     let savedAccounts = []
     if (accountsToSave.length) {
@@ -182,6 +188,110 @@ const filterOperations = operations => {
       // saved io.cozy.bank.operations documents
       .map(({ is_future, ...operation }) => operation) // eslint-disable-line no-unused-vars
   )
+}
+
+/**
+ * Two operations with the same vendorId in the same payload become two
+ * documents, not one: bulkSave runs 30 createOrUpdate in parallel, so both
+ * look for an existing document, both find nothing, and both create one. The
+ * server-side fetching code used to guard against this (its filterOperations
+ * kept a list of the ids it had seen); the client-side rewrite lost it, and
+ * the API does hand back the same operation twice at a page boundary.
+ */
+const dedupePayload = operations => {
+  const seen = new Set()
+  const kept = operations.filter(operation => {
+    const key = String(operation.vendorId)
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+  if (kept.length !== operations.length) {
+    log(
+      'warn',
+      `Bankin' returned #${
+        operations.length - kept.length
+      } operations twice, keeping one copy of each`
+    )
+  }
+  return kept
+}
+
+/**
+ * Leave out the operations already saved under a *different* vendorId.
+ *
+ * Bankin' does not keep an operation's id forever: when a bank connection is
+ * refreshed or re-created, the same real transaction comes back with a new id.
+ * The reconciliator normally covers this — getMissedTransactions runs the fuzzy
+ * matcher below over everything older than its split date, and only saves what
+ * has no counterpart. But we pass useSplitDate: false (we have to, or nothing
+ * older than a week is ever written), and that skips the matcher entirely, so
+ * every re-issued operation lands as a second document: same date, same amount,
+ * same label, and no way for the reconciliator to notice.
+ *
+ * So run the same matcher here, without the seven-day frontier that made the
+ * option unusable in the first place.
+ */
+const dropAlreadySaved = async (accounts, operationsByAccount) => {
+  const [stackAccounts, stackOperations] = await Promise.all([
+    BankAccount.fetchAll(),
+    BankTransaction.fetchAll()
+  ])
+  const cozyIdByVendorId = new Map(
+    stackAccounts
+      .filter(account => account.vendorId && account._id)
+      .map(account => [String(account.vendorId), account._id])
+  )
+  // The matcher reads .label and .date without checking, and a document
+  // written by another source may have neither.
+  const usable = stackOperations.filter(
+    operation => operation && operation.date && operation.label
+  )
+
+  const toSave = []
+  let dropped = 0
+  for (const account of accounts) {
+    const vendorId = String(account.vendorId)
+    const cozyId = cozyIdByVendorId.get(vendorId)
+    // Both keys on purpose: vendorAccountId is what this konnector writes and
+    // it survives reconciliation, while `account` catches the documents saved
+    // under an account document this run no longer matches.
+    const saved = usable.filter(
+      operation =>
+        String(operation.vendorAccountId) === vendorId ||
+        (cozyId && operation.account === cozyId)
+    )
+    const fetched = operationsByAccount[vendorId]
+
+    if (!saved.length) {
+      toSave.push(...fetched)
+      continue
+    }
+
+    const twins = new Set()
+    for (const result of matchTransactions(fetched, saved)) {
+      // A match on the vendor id is the normal case: the operation is already
+      // there under the same id, and the reconciliator will update it in
+      // place. Only a match on the *content* means a second document.
+      if (
+        result.match &&
+        String(result.match.vendorId) !== String(result.transaction.vendorId)
+      ) {
+        twins.add(result.transaction)
+      }
+    }
+    dropped += twins.size
+    toSave.push(...fetched.filter(operation => !twins.has(operation)))
+  }
+
+  if (dropped) {
+    log(
+      'warn',
+      `Left out #${dropped} operations already saved under another ` +
+        `Bankin' id, they would have been duplicates`
+    )
+  }
+  return toSave
 }
 
 const groupByAccount = transactions =>
