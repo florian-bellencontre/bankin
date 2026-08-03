@@ -8347,18 +8347,18 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     }
     // TEMPORARY, remove once the run below has happened.
     //
-    // Hole detection cannot see what is missing from this account. It works on
-    // the calendar of saved days, and a missing incoming transfer on a day that
-    // already carries card activity leaves no gap at all — no stretch of ten
-    // quiet days, nothing to notice. Yet the recorded flows and the balances the
-    // bank reported disagree by 44 228 euros since 2023, so operations are
-    // missing from inside periods that look perfectly covered.
+    // Hole detection works on the calendar of saved days, so it can only find
+    // what is missing from a stretch where nothing at all was saved. An
+    // operation missing on a day that already carries other activity leaves no
+    // gap: no run of quiet days, nothing to notice. Comparing the recorded
+    // flows against the balances the bank reported shows exactly that happening
+    // — they disagree over periods whose calendar looks perfectly covered.
     //
-    // The API serves the whole history (it went back to 2016 in one page for the
-    // other accounts), so asking for all of it and comparing is what settles
-    // whether Bankin' has those operations and we never asked, or whether they
-    // are not there either. Safe to do since 2.9.0: dedupePayload and
-    // dropAlreadySaved exist precisely to make a full refetch idempotent.
+    // The API serves the whole history in a handful of pages per account, so
+    // asking for all of it and comparing is what settles whether the operations
+    // exist upstream and were never asked for, or are not there either. Safe to
+    // do since 2.9.0: dedupePayload and dropAlreadySaved exist precisely to
+    // make a full refetch idempotent.
     // Every account rather than a list of ids: an account number has no place
     // in a source file, and the other accounts return their whole history in a
     // single page anyway, so asking for all of them costs almost nothing more.
@@ -8376,8 +8376,12 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     }
 
     const holes = Object.keys(holesByAccount).length
-    // Kept for the check made once the operations are back.
+    // Kept for the checks made once the operations are back.
     this.holesByAccount = holesByAccount
+    this.savedOperations = saved
+    this.askedWholeHistory = new Set(
+      Object.keys(byAccount).filter(id => byAccount[id] === null)
+    )
 
     this.log(
       'info',
@@ -8463,6 +8467,97 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       }
     }
     await this.rememberConfirmedEmptyGaps(confirmedEmpty)
+  }
+
+  /**
+   * Count the saved operations that Bankin' does not have any more, and what
+   * they are worth.
+   *
+   * Hole detection answers "is a period missing"; this answers the opposite and
+   * so far unasked question, "is the Cozy holding operations the source does
+   * not". Both directions matter, because the recorded flows and the balances
+   * the bank reported disagree, and an operation too many moves the total by
+   * exactly as much as one missing.
+   *
+   * Only accounts whose whole history was asked for are looked at: comparing
+   * against a thirty-day fetch would call everything older an orphan. And the
+   * comparison is done here rather than server-side because the payload is cut
+   * into batches of MAX_OPERATIONS_PER_BATCH before it goes over, so each half
+   * would call the other half's operations missing.
+   *
+   * Aggregates only, on purpose: counts, sums and years say everything needed
+   * to decide, and no operation label has to leave the device to say it.
+   */
+  // P
+  reportOperationsNotAtSource(bankinData) {
+    const saved = this.savedOperations
+    const whole = this.askedWholeHistory
+    if (!saved || !whole || !whole.size || !bankinData) return
+    const fetched = bankinData.allOperations
+    if (!Array.isArray(fetched)) return
+
+    const atSource = new Map()
+    for (const operation of fetched) {
+      const key = String(operation.vendorAccountId || '')
+      if (!atSource.has(key)) atSource.set(key, new Set())
+      atSource.get(key).add(String(operation.vendorId))
+    }
+
+    for (const vendorAccountId of whole) {
+      const ids = atSource.get(vendorAccountId)
+      if (!ids) continue
+      const mine = saved.filter(
+        operation => String(operation.vendorAccountId) === vendorAccountId
+      )
+      const orphans = mine.filter(
+        operation => !ids.has(String(operation.vendorId))
+      )
+      if (!orphans.length) {
+        this.log(
+          'info',
+          `Account ${vendorAccountId}: all ${mine.length} saved operations are ` +
+            `still at the source (${ids.size} there)`
+        )
+        continue
+      }
+      const net = orphans.reduce(
+        (sum, operation) => sum + (Number(operation.amount) || 0),
+        0
+      )
+      // Anything carrying a bill link or a hand-picked category is manual work
+      // that deleting the operation would destroy, so it is counted before any
+      // decision is taken, not after.
+      const precious = orphans.filter(
+        operation =>
+          operation.manualCategoryId ||
+          (operation.bills && operation.bills.length) ||
+          (operation.reimbursements && operation.reimbursements.length)
+      ).length
+      const perYear = {}
+      for (const operation of orphans) {
+        const key = String(operation.date || '').slice(0, 4)
+        if (!perYear[key]) perYear[key] = { n: 0, net: 0 }
+        perYear[key].n++
+        perYear[key].net += Number(operation.amount) || 0
+      }
+      this.log(
+        'warn',
+        `Account ${vendorAccountId}: ${orphans.length} saved operations are ` +
+          `not at the source any more (${mine.length} saved, ${ids.size} at ` +
+          `Bankin'), worth ${net.toFixed(2)} net, average ` +
+          `${(net / orphans.length).toFixed(
+            2
+          )}, ${precious} of them carrying ` +
+          'a bill link or a hand-picked category'
+      )
+      for (const key of Object.keys(perYear).sort()) {
+        this.log(
+          'info',
+          `  ${vendorAccountId} ${key}: ${perYear[key].n} not at the source, ` +
+            `${perYear[key].net.toFixed(2)} net`
+        )
+      }
+    }
   }
 
   /**
@@ -8667,6 +8762,7 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       )
     }
     await this.reportRemainingHoles(bankinData)
+    this.reportOperationsNotAtSource(bankinData)
 
     // Hand the data over to the server part, which owns the bank doctypes:
     // the clisk bridge cannot write io.cozy.bank.* itself. The payload
