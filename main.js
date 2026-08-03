@@ -8557,6 +8557,93 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
             `${perYear[key].net.toFixed(2)} net`
         )
       }
+      this.reportOrphanOrigin(vendorAccountId, orphans, mine, ids)
+    }
+  }
+
+  /**
+   * Say where the operations the source no longer has actually came from. Being
+   * surplus is not a reason to delete them: a surplus operation with a twin
+   * still in the base is a duplicate, and deleting it is housekeeping, whereas
+   * one with no twin is the only remaining record of something that happened,
+   * and deleting it loses information the source cannot give back.
+   *
+   * Two independent signals, because neither is conclusive alone:
+   *
+   * - a twin, looked for on the amount within a few days rather than on the
+   *   exact day and label. An operation re-issued when it goes from pending to
+   *   final keeps its amount and moves its date, so an exact-content test misses
+   *   precisely the duplicates worth finding.
+   * - dateImport, which is a genuine provenance record: applyUpdateIfDifferent
+   *   drops it from every update, so it keeps the date of the *first* import and
+   *   is never rewritten. Grouping by it says which runs created these, which
+   *   can then be matched against what the konnector was doing at the time.
+   */
+  // P
+  reportOrphanOrigin(vendorAccountId, orphans, mine, idsAtSource) {
+    const others = mine.filter(
+      operation => idsAtSource.has(String(operation.vendorId))
+      // Twins are looked for among the operations the source still has, so that
+      // two orphans cannot vouch for each other.
+    )
+    const byAmount = new Map()
+    for (const operation of others) {
+      const key = (Number(operation.amount) || 0).toFixed(2)
+      if (!byAmount.has(key)) byAmount.set(key, [])
+      byAmount.get(key).push(String(operation.date || '').slice(0, 10))
+    }
+    // One twin can only account for one orphan, or a recurring subscription
+    // would vouch for every copy of itself.
+    const used = new Set()
+    let withTwin = 0
+    let twinNet = 0
+    for (const orphan of orphans) {
+      const key = (Number(orphan.amount) || 0).toFixed(2)
+      const when = String(orphan.date || '').slice(0, 10)
+      const candidates = byAmount.get(key) || []
+      const found = candidates.findIndex(
+        (day, i) =>
+          !used.has(`${key}|${i}`) && Math.abs(daysBetween(day, when)) <= 5
+      )
+      if (found !== -1) {
+        used.add(`${key}|${found}`)
+        withTwin++
+        twinNet += Number(orphan.amount) || 0
+      }
+    }
+    this.log(
+      'warn',
+      `Account ${vendorAccountId}: ${withTwin} of the ${orphans.length} have a ` +
+        `twin still at the source (same amount within 5 days), worth ` +
+        `${twinNet.toFixed(2)}; the other ${
+          orphans.length - withTwin
+        } have none, worth ${(
+          orphans.reduce((sum, o) => sum + (Number(o.amount) || 0), 0) - twinNet
+        ).toFixed(2)}`
+    )
+
+    const byImport = {}
+    for (const orphan of orphans) {
+      const key = orphan.dateImport
+        ? String(orphan.dateImport).slice(0, 10)
+        : 'no dateImport'
+      if (!byImport[key]) byImport[key] = { n: 0, net: 0 }
+      byImport[key].n++
+      byImport[key].net += Number(orphan.amount) || 0
+    }
+    const days = Object.entries(byImport).sort((a, b) => b[1].n - a[1].n)
+    this.log(
+      'warn',
+      `Account ${vendorAccountId}: they entered the Cozy over ${days.length} ` +
+        'distinct import day(s); the 15 biggest:'
+    )
+    for (const [when, row] of days.slice(0, 15)) {
+      this.log(
+        'info',
+        `  ${vendorAccountId} imported ${when}: ${row.n}, ${row.net.toFixed(
+          2
+        )} net`
+      )
     }
   }
 
