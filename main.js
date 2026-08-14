@@ -7277,6 +7277,19 @@ const RECONCILE_FOR_REAL = false
 // confirmed case moved by one day; three leaves room without letting a
 // fortnight-old purchase of the same amount pass for a twin.
 const TWIN_DAYS = 3
+// A merge only ever targets a *recent* document, on both its own date and the
+// day it was first imported. A pending operation settles within days, so an
+// older document is not one waiting to settle — it is an orphan from the pile,
+// and rewriting it with today's purchase would repurpose a record that is not
+// the same event. dateImport is the sharper of the two: applyUpdateIfDifferent
+// deletes it from every update, so it keeps saying when the document first
+// arrived and no later run can blur it.
+const MERGE_MAX_AGE_DAYS = 30
+// A bank reconnection re-issues an entire history under new ids at once. Every
+// one of those looks exactly like a settled twin, and merging hundreds of
+// documents in one run is precisely when a systematic mistake would do the most
+// damage. Past this count the run merges nothing and says so.
+const MAX_MERGES_PER_RUN = 50
 
 // CouchDB refuses documents above 8 MB and the payload rides in the account
 // document; ~370 bytes per operation leaves plenty of room at this size.
@@ -7288,11 +7301,19 @@ const MAX_OPERATIONS_PER_BATCH = 5000
  * the operations, and they are tiny compared to the operations.
  */
 const splitOperations = (bankinData, size) => {
-  const { accounts, allOperations } = bankinData
+  const { accounts, allOperations, merges } = bankinData
   if (allOperations.length <= size) return [bankinData]
   const batches = []
   for (let i = 0; i < allOperations.length; i += size) {
-    batches.push({ accounts, allOperations: allOperations.slice(i, i + size) })
+    // merges rides on every slice, like the accounts. Applying one twice
+    // writes the same content twice, so a retried or duplicated batch is
+    // harmless; carrying it on the first slice alone would instead lose the
+    // whole set the day that slice is the one that fails.
+    batches.push({
+      accounts,
+      merges,
+      allOperations: allOperations.slice(i, i + size)
+    })
   }
   return batches
 }
@@ -8525,6 +8546,61 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       )
     }
 
+    // The two harvests of this pass, kept apart because they are answered by
+    // opposite means: a merge rewrites one document and creates nothing, a
+    // cleanup needs a deletion and therefore a human and a backup.
+    const merges = []
+    const cleanup = []
+    const today = new Date().toISOString().slice(0, 10)
+    const recent = date =>
+      Boolean(date) &&
+      daysBetween(String(date).slice(0, 10), today) <= MERGE_MAX_AGE_DAYS
+    // Both clocks have to be recent, and they say different things: `date` is
+    // when the money moved, `dateImport` when this konnector first saw it.
+    const mergeable = ghost => recent(day(ghost)) && recent(ghost.dateImport)
+    // Only what the settled version actually redefines. Everything absent from
+    // this list survives untouched — the document keeps its _id, so the
+    // hand-picked category and the linked bills come along with it.
+    const mergeInstruction = (ghost, twin) => ({
+      _id: ghost._id,
+      was: { vendorId: String(ghost.vendorId), date: day(ghost) },
+      set: {
+        vendorId: String(twin.vendorId),
+        label: twin.label,
+        originalBankLabel: twin.originalBankLabel,
+        amount: twin.amount,
+        date: twin.date,
+        dateOperation: twin.dateOperation
+      }
+    })
+    // What the review page needs to show a pair side by side and let it be
+    // judged. The ghost's _id is what a deletion would target; the twin's
+    // vendorId is how the survivor is found to carry the category over.
+    const pairForReview = (ghost, twin, vendorAccountId) => ({
+      account: vendorAccountId,
+      amount: ghost.amount,
+      ghost: {
+        _id: ghost._id,
+        vendorId: String(ghost.vendorId),
+        date: day(ghost),
+        dateImport: String(ghost.dateImport || '').slice(0, 10),
+        label: ghost.label,
+        originalBankLabel: ghost.originalBankLabel,
+        manualCategoryId: ghost.manualCategoryId || null,
+        bills:
+          (ghost.relationships &&
+            ghost.relationships.bills &&
+            ghost.relationships.bills.data) ||
+          []
+      },
+      twin: {
+        vendorId: String(twin.vendorId),
+        date: day(twin),
+        label: twin.label,
+        originalBankLabel: twin.originalBankLabel
+      }
+    })
+
     const groupBy = (list, key) => {
       const groups = new Map()
       for (const item of list) {
@@ -8623,14 +8699,20 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
           counts.alone++
           continue
         }
-        claimed.add(candidates[0])
+        const twin = candidates[0]
+        claimed.add(twin)
         counts.net += ghost.amount
         if (precious(ghost)) counts.precious++
         // Already saved as a second document: that is the pile, and only a
         // deletion clears it. Not saved yet: this run would have created the
         // second document, and the merge is what prevents it.
-        if (savedIds.has(String(candidates[0].vendorId))) counts.twinned++
-        else counts.pending++
+        if (savedIds.has(String(twin.vendorId))) {
+          counts.twinned++
+          cleanup.push(pairForReview(ghost, twin, vendorAccountId))
+        } else {
+          counts.pending++
+          if (mergeable(ghost)) merges.push(mergeInstruction(ghost, twin))
+        }
       }
 
       const confirmed = counts.twinned + counts.pending
@@ -8674,6 +8756,80 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
         `${total.precious} of them carry a hand-picked category or a bill.` +
         (RECONCILE_FOR_REAL ? '' : ' Report only, nothing was changed.')
     )
+
+    // The merge candidates, once the age guards have had their say. The gap
+    // between this count and the "would prevent" one above is exactly what the
+    // guards refused, and it is worth seeing rather than inferring.
+    const refused = total.pending - merges.length
+    if (merges.length > MAX_MERGES_PER_RUN) {
+      this.log(
+        'warn',
+        `${merges.length} merges planned, over the ${MAX_MERGES_PER_RUN} ` +
+          'allowed in one run: this looks like a bank reconnection re-issuing ' +
+          'a whole history rather than operations settling one by one. ' +
+          'Merging nothing, and leaving them for a reviewed cleanup instead'
+      )
+      merges.length = 0
+    } else {
+      this.log(
+        'info',
+        `${merges.length} merge(s) planned, ${refused} of the ` +
+          `${total.pending} candidate(s) refused by the ${MERGE_MAX_AGE_DAYS} ` +
+          'day age guards' +
+          (RECONCILE_FOR_REAL ? '' : ' — report only, none will be applied')
+      )
+    }
+
+    await this.saveCleanupPlan(cleanup)
+    return merges
+  }
+
+  /**
+   * Leave the reviewable cleanup plan in the Drive, as a file the user can
+   * download and open.
+   *
+   * It is written rather than acted upon on purpose. A merge rewrites one
+   * document and can be undone by the next run; a cleanup deletes, and an
+   * operation absent from the source is one no later run brings back. That
+   * asymmetry is the whole reason this half of the work stops at a file.
+   *
+   * Nothing here reaches the logs: the plan carries labels and amounts, and
+   * logs are the one place that data has no business being.
+   */
+  // P
+  async saveCleanupPlan(pairs) {
+    if (!pairs.length) return
+    const plan = {
+      generated: new Date().toISOString(),
+      twinDays: TWIN_DAYS,
+      pairs
+    }
+    const filename = `bankin-cleanup-${new Date()
+      .toISOString()
+      .slice(0, 10)}.json`
+    try {
+      const json = JSON.stringify(plan)
+      // btoa is byte-oriented and labels carry accents; percent-encode first so
+      // the file comes back out as the UTF-8 it went in as.
+      const base64 = window.btoa(unescape(encodeURIComponent(json)))
+      await this.saveFiles(
+        [
+          {
+            filename,
+            dataUri: `data:application/json;base64,${base64}`,
+            shouldReplaceFile: () => true
+          }
+        ],
+        { context: {}, contentType: 'application/json' }
+      )
+      this.log(
+        'info',
+        `Cleanup plan written to the Drive as ${filename}: ${pairs.length} ` +
+          'pair(s) to review. Nothing is deleted until you say so'
+      )
+    } catch (err) {
+      this.log('warn', `Could not write the cleanup plan: ${err}`)
+    }
   }
 
   /**
@@ -8887,7 +9043,29 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       )
     }
     await this.reportRemainingHoles(bankinData)
-    await this.reportGhostOperations(bankinData)
+    const merges = await this.reportGhostOperations(bankinData)
+    if (RECONCILE_FOR_REAL && merges.length) {
+      // The settled operation must not be saved on its own as well, or the
+      // second document appears anyway and the merge has bought nothing: its
+      // content is going onto the document it supersedes.
+      const superseded = new Set(merges.map(merge => merge.set.vendorId))
+      const before = bankinData.allOperations.length
+      bankinData.allOperations = bankinData.allOperations.filter(
+        operation => !superseded.has(String(operation.vendorId))
+      )
+      // Computed here rather than server-side on purpose: the payload is cut
+      // into batches below, and each batch holds only a slice of the history.
+      // A set difference run on a slice would call thousands of perfectly live
+      // operations missing, for the sole reason that they were in the other
+      // batch.
+      bankinData.merges = merges
+      this.log(
+        'info',
+        `Applying ${merges.length} merge(s); ` +
+          `${before - bankinData.allOperations.length} operation(s) left out ` +
+          'because they are going onto the document they supersede'
+      )
+    }
 
     // Hand the data over to the server part, which owns the bank doctypes:
     // the clisk bridge cannot write io.cozy.bank.* itself. The payload
