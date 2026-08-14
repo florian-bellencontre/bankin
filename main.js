@@ -7260,6 +7260,24 @@ const BACKFILL_DAYS = 180
 // of silently keeping the konnector away from them. See getConfirmedEmptyGaps.
 const EMPTY_GAPS_VERSION = 2
 
+// TEST BUILD ONLY — both of these go away before this ships.
+//
+// The ghost report below can only conclude anything on an account whose whole
+// history was walked this run: "absent from the source" and "never asked for"
+// are indistinguishable otherwise, and mistaking the second for the first is
+// how real history gets called a duplicate. So the test run asks for
+// everything. In the shipped version this is the user-facing "resynchronise
+// from scratch" switch, not a constant.
+const FULL_SYNC_TEST = true
+// Report only. Nothing is written and nothing is deleted while this is false;
+// flipping it is a separate, later decision, taken on the numbers this run
+// prints rather than on the strength of the heuristic.
+const RECONCILE_FOR_REAL = false
+// How far apart a pending operation and its settled version can sit. The
+// confirmed case moved by one day; three leaves room without letting a
+// fortnight-old purchase of the same amount pass for a twin.
+const TWIN_DAYS = 3
+
 // CouchDB refuses documents above 8 MB and the payload rides in the account
 // document; ~370 bytes per operation leaves plenty of room at this size.
 const MAX_OPERATIONS_PER_BATCH = 5000
@@ -8246,6 +8264,9 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       this.log('warn', `Could not read the saved operations: ${err.message}`)
       return null // no idea, take everything
     }
+    // Kept for reportGhostOperations, which needs the same collection: reading
+    // it twice is the very cost the batching work went and removed.
+    this.savedOperations = operations
 
     const saved = (operations || []).filter(
       operation => operation && operation.date
@@ -8436,6 +8457,226 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
   }
 
   /**
+   * Count the saved operations Bankin' does not serve any more, and say which
+   * of them are a superseded copy of one it still does.
+   *
+   * Report only: this method writes nothing and deletes nothing.
+   *
+   * Where the duplicates come from. Bankin' hands over a card operation while
+   * it is still pending, then re-issues it once it settles under a *new
+   * vendorId* and a *rewritten label* — the pending one carries the short
+   * merchant name, the settled one the full terminal string. cozy-doctypes'
+   * matcher scores amount plus label and needs one label to contain the other;
+   * these two only share a prefix, so it scores below zero and the pair goes
+   * unrecognised. Two documents, one real purchase.
+   *
+   * Why this is a set difference and not a resemblance. A document whose
+   * vendorId is absent from what the API just served is *known* dead, not
+   * suspected. That alone would not do — an operation can be absent because it
+   * was genuinely dropped at the source, and deleting it would lose history
+   * that no later run brings back. So a ghost is only counted when a live
+   * operation of the *same account and the exact same amount* sits within
+   * TWIN_DAYS of it, and when it is the only such candidate. Dead at the
+   * source, twin alive, no ambiguity.
+   *
+   * Two guards carry the whole thing:
+   *
+   *  - the account must have been walked to the end this run (stoppedEarly
+   *    false), and only the stretch the walk actually reached is considered.
+   *    Without this, "the API did not return it" and "we never asked" look the
+   *    same, and calling the second a duplicate destroys real history;
+   *  - a live operation is claimed by at most one ghost, and a ghost with
+   *    several candidates is left alone. Two genuine identical purchases days
+   *    apart therefore pair off instead of eating each other.
+   *
+   * A deferred-debit card needs no special case: its monthly aggregate is
+   * served by the API, so it is never dead, so it is never a ghost.
+   */
+  // P
+  async reportGhostOperations(bankinData) {
+    if (!bankinData || !Array.isArray(bankinData.allOperations)) return
+    // getFetchSince has already read the collection this run; re-reading it
+    // would double the slowest part of the pilot for nothing.
+    let saved = this.savedOperations
+    if (!saved) {
+      try {
+        saved = await this.queryAll({
+          toDefinition: () => ({ doctype: 'io.cozy.bank.operations' })
+        })
+      } catch (err) {
+        this.log('warn', `Ghost report: could not read what is saved: ${err}`)
+        return
+      }
+    }
+
+    const day = operation => String(operation.date || '').slice(0, 10)
+    const cents = amount => Number(amount || 0).toFixed(2)
+    // Hand-picked categories and linked bills are the user's own work. They
+    // decide which document of a pair survives, so they are counted here.
+    const precious = operation => {
+      const bills =
+        operation.relationships &&
+        operation.relationships.bills &&
+        operation.relationships.bills.data
+      // An empty relationship is written by default on every operation, so the
+      // key existing means nothing; only a non-empty list is the user's work.
+      return Boolean(
+        operation.manualCategoryId || (Array.isArray(bills) && bills.length)
+      )
+    }
+
+    const groupBy = (list, key) => {
+      const groups = new Map()
+      for (const item of list) {
+        const id = String(item[key] || '')
+        if (!groups.has(id)) groups.set(id, [])
+        groups.get(id).push(item)
+      }
+      return groups
+    }
+    const atSource = groupBy(bankinData.allOperations, 'vendorAccountId')
+    const inCozy = groupBy(
+      (saved || []).filter(
+        operation =>
+          operation && operation.date && typeof operation.amount === 'number'
+      ),
+      'vendorAccountId'
+    )
+
+    const total = {
+      accounts: 0,
+      skipped: 0,
+      dead: 0,
+      twinned: 0,
+      pending: 0,
+      ambiguous: 0,
+      alone: 0,
+      precious: 0,
+      net: 0
+    }
+
+    // Iterating the accounts the fetch covered, not the ones it brought
+    // operations back for: an account whose operations were all dropped at the
+    // source returns nothing, and skipping it silently is how the worst case
+    // would go unnoticed.
+    for (const vendorAccountId of Object.keys(bankinData.reachedBack || {})) {
+      const sourceOperations = atSource.get(vendorAccountId) || []
+      const reached = (bankinData.reachedBack || {})[vendorAccountId] || {}
+      if (reached.stoppedEarly) {
+        total.skipped++
+        this.log(
+          'info',
+          `Account ${vendorAccountId}: partial fetch, nothing can be ` +
+            'concluded about missing operations'
+        )
+        continue
+      }
+      total.accounts++
+
+      const sourceIds = new Set(
+        sourceOperations.map(operation => String(operation.vendorId))
+      )
+      const mine = inCozy.get(vendorAccountId) || []
+      const savedIds = new Set(
+        mine.map(operation => String(operation.vendorId))
+      )
+      // Only the stretch the pagination actually reached. Anything older was
+      // never asked for this run and proves nothing. No oldest at all, with the
+      // walk having ended by itself, means the account holds nothing at the
+      // source — then everything saved on it is in range, and being unable to
+      // say so is worse than saying it.
+      const inRange = reached.oldest
+        ? mine.filter(operation => day(operation) >= reached.oldest)
+        : mine
+      const dead = inRange
+        .filter(operation => !sourceIds.has(String(operation.vendorId)))
+        // Sorted so the run is reproducible: when two ghosts could claim the
+        // same live operation, whoever comes first takes it, and an arbitrary
+        // order would move the counts between runs for no reason.
+        .sort((a, b) => day(a).localeCompare(day(b)))
+      // Operations that have not happened yet cannot be anybody's settled
+      // version.
+      const alive = sourceOperations.filter(operation => !operation.is_future)
+
+      const claimed = new Set()
+      const counts = {
+        twinned: 0,
+        pending: 0,
+        ambiguous: 0,
+        alone: 0,
+        precious: 0,
+        net: 0
+      }
+      for (const ghost of dead) {
+        const candidates = alive.filter(
+          operation =>
+            !claimed.has(operation) &&
+            String(operation.vendorId) !== String(ghost.vendorId) &&
+            cents(operation.amount) === cents(ghost.amount) &&
+            Math.abs(daysBetween(day(ghost), day(operation))) <= TWIN_DAYS
+        )
+        if (candidates.length > 1) {
+          counts.ambiguous++
+          continue
+        }
+        if (!candidates.length) {
+          counts.alone++
+          continue
+        }
+        claimed.add(candidates[0])
+        counts.net += ghost.amount
+        if (precious(ghost)) counts.precious++
+        // Already saved as a second document: that is the pile, and only a
+        // deletion clears it. Not saved yet: this run would have created the
+        // second document, and the merge is what prevents it.
+        if (savedIds.has(String(candidates[0].vendorId))) counts.twinned++
+        else counts.pending++
+      }
+
+      const confirmed = counts.twinned + counts.pending
+      total.dead += dead.length
+      total.twinned += counts.twinned
+      total.pending += counts.pending
+      total.ambiguous += counts.ambiguous
+      total.alone += counts.alone
+      total.precious += counts.precious
+      total.net += counts.net
+
+      // inRange, not the whole account: it is the only count comparable to what
+      // the source served, since the rest was never in question.
+      const walked =
+        `${inRange.length} saved over the walked stretch ` +
+        `(from ${reached.oldest || 'nothing at all'}), ` +
+        `${sourceOperations.length} at the source`
+      if (!dead.length) {
+        this.log('info', `Account ${vendorAccountId}: ${walked}, none missing`)
+        continue
+      }
+      this.log(
+        confirmed ? 'warn' : 'info',
+        `Account ${vendorAccountId}: ${walked}, ${dead.length} not served ` +
+          `any more — ${confirmed} have a single live twin ` +
+          `(${counts.twinned} already saved twice, ${counts.pending} about ` +
+          `to be), ${counts.ambiguous} are ambiguous and ${counts.alone} ` +
+          `have none. Net of the confirmed: ${counts.net.toFixed(2)}, of ` +
+          `which ${counts.precious} carry a hand-picked category or a bill`
+      )
+    }
+
+    this.log(
+      'info',
+      `Ghost report over ${total.accounts} fully walked account(s), ` +
+        `${total.skipped} skipped: ${total.dead} operations are not served ` +
+        `any more. ${total.twinned + total.pending} have a single live twin ` +
+        `(${total.twinned} to clean up, ${total.pending} the merge would ` +
+        `prevent), ${total.ambiguous} ambiguous, ${total.alone} without a ` +
+        `twin. Net of the confirmed: ${total.net.toFixed(2)}, ` +
+        `${total.precious} of them carry a hand-picked category or a bill.` +
+        (RECONCILE_FOR_REAL ? '' : ' Report only, nothing was changed.')
+    )
+  }
+
+  /**
    * The stretches Bankin' has confirmed it has nothing for, kept between runs
    * next to the history start. Shaped { vendorAccountId: ['from>to', ...] }.
    *
@@ -8580,7 +8821,16 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     // retry once rather than reporting a fetch failure.
     const deviceId = (this.store && this.store.deviceId) || ''
     const apiClient = await this.getApiCredentials()
-    const since = await this.getFetchSince()
+    // Called even when the answer is overridden below: it is what works out
+    // this.holesByAccount, which reportRemainingHoles needs.
+    let since = await this.getFetchSince()
+    if (FULL_SYNC_TEST) {
+      this.log(
+        'info',
+        'Full sync test: asking for the whole history on every account'
+      )
+      since = { fallback: null, byAccount: {} }
+    }
     this.log(
       'info',
       `API client: ${
@@ -8637,6 +8887,7 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       )
     }
     await this.reportRemainingHoles(bankinData)
+    await this.reportGhostOperations(bankinData)
 
     // Hand the data over to the server part, which owns the bank doctypes:
     // the clisk bridge cannot write io.cozy.bank.* itself. The payload
