@@ -8820,7 +8820,14 @@ class BankinContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
             shouldReplaceFile: () => true
           }
         ],
-        { context: {}, contentType: 'application/json' }
+        {
+          context: {},
+          contentType: 'application/json',
+          // Required, and it is what saveFiles dedupes on: the filename alone
+          // is the identity here, so re-running the same day replaces the plan
+          // instead of piling up copies of it.
+          fileIdAttributes: ['filename']
+        }
       )
       this.log(
         'info',
