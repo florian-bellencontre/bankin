@@ -7268,7 +7268,7 @@ const EMPTY_GAPS_VERSION = 2
 // how real history gets called a duplicate. So the test run asks for
 // everything. In the shipped version this is the user-facing "resynchronise
 // from scratch" switch, not a constant.
-const FULL_SYNC_TEST = true
+const FULL_SYNC_TEST = false
 // Report only. Nothing is written and nothing is deleted while this is false;
 // flipping it is a separate, later decision, taken on the numbers this run
 // prints rather than on the strength of the heuristic.
